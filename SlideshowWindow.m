@@ -807,8 +807,9 @@ scheduledTimerWithTimeInterval:timerIntvl
 			// actually, '=' doesn't center the pic, so this is wrong
 			// if you zoom or move a pic while in actualsize mode, you're basically stuck with a non-default zoom
 			// intentional fall-through to next cases
-		case '+':
-		case '-':
+        case '+':
+        case '-':
+        case '_':
 			if (currentIndex == [filenames count]) { NSBeep(); return; }
 			if ((obj = [imgCache infoForKey:[filenames objectAtIndex:currentIndex]])) {
 				if (obj->image == [imgView image]
@@ -817,7 +818,7 @@ scheduledTimerWithTimeInterval:timerIntvl
 							  zooming:c == '=' ? DYImageViewZoomModeActualSize : c == '+' ? DYImageViewZoomModeZoomIn : DYImageViewZoomModeZoomOut];
 				} else {
 					if (c == '+') [imgView zoomIn];
-					else if (c == '-') [imgView zoomOut];
+                    else if (c == '-' || c == '_') [imgView zoomOut];
 					else [imgView zoomActualSize];
 				}
 				[self updateInfoFld];
