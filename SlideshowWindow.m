@@ -651,6 +651,7 @@ scheduledTimerWithTimeInterval:timerIntvl
 			case NSDownArrowFunctionKey:
 			case NSLeftArrowFunctionKey:
 			case NSUpArrowFunctionKey:
+			case NSDeleteCharacter:
 			case NSPageUpFunctionKey:
 			case NSPageDownFunctionKey:
 				[self displayImage];
@@ -721,6 +722,7 @@ scheduledTimerWithTimeInterval:timerIntvl
 			break;
 		case NSLeftArrowFunctionKey:
 		case NSUpArrowFunctionKey:
+		case NSDeleteCharacter:
 			[self jump:-1 ordered:([e modifierFlags] & NSAlternateKeyMask) != 0];
 			break;
 		case NSHomeFunctionKey:
