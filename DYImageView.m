@@ -22,6 +22,8 @@
 	float tmp;
 	NSSize imgSize = [image size]; // in pixels
 	NSSize bSize = [self convertRect:[self bounds] toView:nil].size; // in pixels (window units)
+	bSize.height -= [[NSScreen mainScreen] safeAreaInsets].top;
+
 	if (rotation == 90 || rotation == -90) {
 		tmp = bSize.width;
 		bSize.width = bSize.height;
@@ -51,6 +53,8 @@
 	NSRect srcRect, destinationRect;
 	float zoom = zoomF;
 	NSRect boundsRect = [self convertRect:[self bounds] toView:nil];
+	boundsRect.size.height -= [[NSScreen mainScreen] safeAreaInsets].top;
+
 	float centerX, centerY; float tmp;
 	centerX = boundsRect.size.width/2;
 	centerY = boundsRect.size.height/2;
@@ -199,6 +203,8 @@
 	NSSize imgSize = [image size];
 	float tmp;
 	NSSize bSize = [self convertRect:[self bounds] toView:nil].size;
+	bSize.height -= [[NSScreen mainScreen] safeAreaInsets].top;
+
 	if (rotation == 90 || rotation == -90) {
 		tmp = bSize.height;
 		bSize.height = bSize.width;
@@ -362,6 +368,8 @@
 
 	float tmp;
 	NSSize bSize = [self convertRect:[self bounds] toView:nil].size;
+	bSize.height -= [[NSScreen mainScreen] safeAreaInsets].top;
+
 	if (rotation == 90 || rotation == -90) {
 		tmp = bSize.height;
 		bSize.height = bSize.width;

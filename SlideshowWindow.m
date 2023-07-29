@@ -189,11 +189,15 @@ static BOOL UsingMagicMouse(NSEvent *e) {
 	[oldScreen release];
 	oldScreen = [[NSScreen mainScreen] retain];
 	NSSize oldSize = [imgCache boundingSize];
-	if (oldSize.width < screenRect.size.width
-		|| oldSize.height < screenRect.size.height) {
+
+	CGSize s = screenRect.size;
+	s.height -= [[self screen] safeAreaInsets].top;
+
+	if (oldSize.width < s.width
+		|| oldSize.height < s.height) {
 		[imgCache removeAllImages];
 	}
-	[imgCache setBoundingSize:screenRect.size]; // boundingSize for the cache is actually in pixels
+	[imgCache setBoundingSize:s]; // boundingSize for the cache is actually in pixels
 	[self setFrame:screenRect display:NO];
 	[catsFld setFrame:NSMakeRect(0,[imgView bounds].size.height-20,300,20)];
 	// ** OR set springiness on awake
@@ -321,6 +325,8 @@ scheduledTimerWithTimeInterval:timerIntvl
 - (float)calcZoom:(NSSize)sourceSize {
 	// calc here b/c larger images have already been cached & shrunk!
 	NSRect boundsRect = [imgView convertRect:[imgView bounds] toView:nil]; // get pixels, not points
+	boundsRect.size.height -= [[self screen] safeAreaInsets].top;
+
 	int rotation = [imgView rotation];
 	float tmp;
 	if (rotation == 90 || rotation == -90) {
@@ -466,9 +472,12 @@ scheduledTimerWithTimeInterval:timerIntvl
 			[imgView setRotation:r];
 			[imgView setFlip:imgFlipped];
 		}
+
+		NSRect rect = [imgView bounds];
+		rect.size.height -= [[self screen] safeAreaInsets].top;
 		if (zoomInfo || ([imgView showActualSize] &&
-						 !(info->pixelSize.width < [imgView bounds].size.width &&
-						   info->pixelSize.height < [imgView bounds].size.height))) {
+						 !(info->pixelSize.width < rect.size.width &&
+						   info->pixelSize.height < rect.size.height))) {
 			[imgView setImage:[NSImage imageByReferencingFileIgnoringJPEGOrientation:ResolveAliasToPath(theFile)]
 					  zooming:zoomInfo ? DYImageViewZoomModeManual : DYImageViewZoomModeActualSize];
 			if (zoomInfo) [imgView setZoomInfo:zoomInfo];
@@ -674,7 +683,7 @@ scheduledTimerWithTimeInterval:timerIntvl
 				if (c<=3) y = 1; else if (c>=7) y = -1; else y = 0;
 				if (c%3 == 0) x = -1; else if (c%3 == 1) x = 1; else x=0;
 				[imgView fakeDragX:([imgView bounds].size.width/2)*x
-								 y:([imgView bounds].size.height/2)*y];
+                                 y:(([imgView bounds].size.height - [[self screen] safeAreaInsets].top)/2)*y];
 			}
 		} else {
 			if (timerIntvl == 0 || timerPaused) [self jump:1];
