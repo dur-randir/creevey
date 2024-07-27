@@ -1,4 +1,4 @@
-//Copyright 2005 Dominic Yu. Some rights reserved.
+//Copyright 2005-2023 Dominic Yu. Some rights reserved.
 //This work is licensed under the Creative Commons
 //Attribution-NonCommercial-ShareAlike License. To view a copy of this
 //license, visit http://creativecommons.org/licenses/by-nc-sa/2.0/ or send
@@ -9,77 +9,13 @@
 #import "NSIndexSetSymDiffExtension.h"
 #import "CreeveyMainWindowController.h"
 #import "DYCarbonGoodies.h"
-
-#import "DYImageCache.h" // kludge to access the thumbsCache
-#import "CreeveyController.h"
-
+#import "NSMutableArray+DYMovable.h"
+#import "NSColor+TextColor.h"
 
 #define MAX_EXIF_WIDTH  160
 #define MIN_CELL_WIDTH  40
-#define DEFAULT_CELL_WIDTH 120
-// height is 3/4 * width
 #define PADDING 16
-#define VERTPADDING 16
 #define DEFAULT_TEXTHEIGHT 12
-
-/* there are some methods called in a separate thread:
-   addSelectedIndex
-   removeAllImages
-   addImage:withFilename:
-   imageWithFileInfoNeedsDisplay:
-
-   i've tried to make them thread-safe
- */
-
-@interface NSImage (ImageRotationAddition)
-// helper method to generate a new NSImage and make it draw that instead.
-- (NSImage *)rotateByExifOrientation:(unsigned short)n;
-@end
-
-@implementation NSImage (ImageRotationAddition)
-- (NSImage *)rotateByExifOrientation:(unsigned short)n; {
-	NSSize newSize = [self size];
-	if (n >= 5) {
-		// if rotating, swap the width/height
-		float tmp;
-		tmp = newSize.width;
-		newSize.width = newSize.height;
-		newSize.height = tmp;
-	}
-	NSImage *rotImg = [[[NSImage alloc] initWithSize:newSize] autorelease];
-	[rotImg lockFocus];
-	int r = 0, x0 = 0, y0 = 0; BOOL imgFlipped = NO;
-	switch (n) {
-		case 4: r = 180; case 2: imgFlipped = YES; break;
-		case 5: imgFlipped = YES; case 8: r = 90; break;
-		case 7: imgFlipped = YES; case 6: r = -90; break;
-		case 3: r = 180; break;
-	}
-	switch (n) {
-		case 2: x0 = -newSize.width; break;
-		case 3: x0 = -newSize.width; y0 = -newSize.height; break;
-		case 4: y0 = -newSize.height; break;
-		case 5: x0 = -newSize.height; y0 = -newSize.width; break;
-		case 6: x0 = -newSize.height; break;
-		case 8: y0 = -newSize.width; break;
-	}
-	NSAffineTransform *transform = [NSAffineTransform transform];
-	[transform rotateByDegrees:r];
-	if (imgFlipped)
-		[transform scaleXBy:-1 yBy:1];
-	[transform concat];
-	
-	[self drawAtPoint:NSMakePoint(x0, y0)
-			 fromRect:NSZeroRect
-			operation:NSCompositeSourceOver  
-			 fraction:1.0];
-	[rotImg unlockFocus];
-	return rotImg;
-}
-@end
-
-
-
 
 static NSRect ScaledCenteredRect(NSSize sourceSize, NSRect boundsRect) {
 	NSRect destinationRect;
@@ -102,21 +38,73 @@ static NSRect ScaledCenteredRect(NSSize sourceSize, NSRect boundsRect) {
 	}
 	
 	// origin
-	destinationRect.origin.x = (int)(NSMidX(boundsRect) - destinationRect.size.width/2);
-	destinationRect.origin.y = (int)(NSMidY(boundsRect) - destinationRect.size.height/2);
-	//return NSIntegralRect(destinationRect);
+	destinationRect.origin.x = round(NSMidX(boundsRect) - destinationRect.size.width/2);
+	destinationRect.origin.y = round(NSMidY(boundsRect) - destinationRect.size.height/2);
 	return destinationRect;
 }
 
-@interface DYWrappingMatrix ()
+@interface DYMatrixState () {
+	@public
+	NSUInteger numCells;
+	int numCols;
+	float area_w, area_h;
+	NSRect visibleRect;
+}
+@property (nonatomic, copy) NSArray *filenames;
+@end
+
+@implementation DYMatrixState
+- (BOOL)imageWithFileInfoNeedsDisplay:(NSArray *)d {
+	NSUInteger i = [d[1] unsignedIntegerValue];
+	if (i < numCells && [_filenames[i] isEqualToString:d[0]]) {
+		NSUInteger row = i/numCols, col = i%numCols;
+		NSPoint p = NSMakePoint(area_w*col,area_h*row);
+		if (NSPointInRect(p, visibleRect)) return YES;
+		// adjust these values by one point to make sure NSPointInRect handles the bottom right corner correctly
+		p.x += area_w - 1;
+		p.y += area_h - 1;
+		return NSPointInRect(p, visibleRect);
+	}
+	return NO;
+}
+@end
+
+
+#pragma mark - DYWrappingMatrix -
+
+@interface DYWrappingMatrix () <NSDraggingSource>
 - (void)resize:(id)anObject; // called to recalc, set frame height
-- (NSImage *)imageForIndex:(NSUInteger)n;
-- (NSSize)imageSizeForIndex:(NSUInteger)n;
-- (unsigned short)exifOrientationForIndex:(NSUInteger)n;
-@property (nonatomic, retain) NSArray *openWithAppIdentifiers;
+@property (nonatomic, strong) NSArray *openWithAppIdentifiers; // saved in mouseDown for subsequent use by the context menu
 @end
 
 @implementation DYWrappingMatrix
+{
+	NSColor *bgColor;
+	BOOL autoRotate;
+	NSImageCell *myCell;           // one cell, reused for efficiency
+	NSTextFieldCell *myTextCell; // for drawing the file name
+	NSMutableArray *images;
+	NSMutableArray *filenames;
+	NSMutableSet *requestedFilenames; // keep track of which files we've requested images for
+	float cellWidth;
+	NSUInteger numCells;
+	NSMutableIndexSet *selectedIndexes;
+	
+	BOOL dragEntered;
+	
+	// vars used for repeated calculations
+	int numCols;
+	float cellHeight, columnSpacing, area_w, area_h;
+	unsigned int textHeight;
+	
+	float _maxCellWidth;
+	float _hPadding, _vPadding;
+	NSSize _contentSize;
+	BOOL _respondsToLoadImageForFile, _respondsToSelectionDidChange;
+	NSMutableArray *_movedUrls, *_originPaths;
+	id __weak _appDelegate;
+}
+@synthesize delegate, loadingImage;
 
 + (Class)cellClass { return [NSActionCell class]; }
 	// NSActionCell or subclass required for target/action
@@ -126,29 +114,25 @@ static NSRect ScaledCenteredRect(NSSize sourceSize, NSRect boundsRect) {
 {
 	if (self != [DYWrappingMatrix class]) return;
 	// prefs stuff
-    NSMutableDictionary *dict = [NSMutableDictionary dictionary];
-	NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-	dict[@"DYWrappingMatrixBgColor"] = [NSArchiver archivedDataWithRootObject:[NSColor controlBackgroundColor]];
-	dict[@"DYWrappingMatrixAllowMove"] = @NO;
-	dict[@"DYWrappingMatrixMaxCellWidth"] = @"160";
-	[defaults registerDefaults:dict];
+	[NSUserDefaults.standardUserDefaults registerDefaults:@{
+		@"DYWrappingMatrixBgColor": [NSKeyedArchiver archivedDataWithRootObject:NSColor.controlBackgroundColor requiringSecureCoding:YES error:NULL],
+		@"DYWrappingMatrixAllowMove": @NO,
+		@"DYWrappingMatrixMaxCellWidth": @"160",
+		@"thumbPadding": @(PADDING),
+	}];
 	
-    static BOOL initialized = NO;
-    /* Make sure code only gets executed once. */
-    if (initialized) return;
-    initialized = YES;
     id sendTypes = @[NSFilenamesPboardType];
     [NSApp registerServicesMenuSendTypes:sendTypes returnTypes:@[]];
 }
 + (NSSize)maxCellSize {
-	int w = [[NSUserDefaults standardUserDefaults] integerForKey:@"DYWrappingMatrixMaxCellWidth"];
+	NSInteger w = [NSUserDefaults.standardUserDefaults integerForKey:@"DYWrappingMatrixMaxCellWidth"];
 	return NSMakeSize(w, w*3/4);
 }
 
 - (id)validRequestorForSendType:(NSString *)sendType
 					 returnType:(NSString *)returnType {
     if (!returnType && [sendType isEqual:NSFilenamesPboardType]) {
-		if ([[self selectedIndexes] count] > 0)
+		if (selectedIndexes.count > 0)
 			return self;
 	}
     return [super validRequestorForSendType:sendType
@@ -165,49 +149,78 @@ static NSRect ScaledCenteredRect(NSSize sourceSize, NSRect boundsRect) {
 }
 
 #pragma mark init stuff
-- (id)initWithFrame:(NSRect)frameRect
+- (instancetype)initWithFrame:(NSRect)frameRect
 {
 	if ((self = [super initWithFrame:frameRect]) != nil) {
 		myCell = [[NSImageCell alloc] initImageCell:nil];
-		myTextCell = [[NSCell alloc] init];
-		[myTextCell setAlignment:NSCenterTextAlignment];
+		myTextCell = [[NSTextFieldCell alloc] init];
+		myTextCell.alignment = NSTextAlignmentCenter;
 		images = [[NSMutableArray alloc] initWithCapacity:100];
 		filenames = [[NSMutableArray alloc] initWithCapacity:100];
 		selectedIndexes = [[NSMutableIndexSet alloc] init];
 		requestedFilenames = [[NSMutableSet alloc] init];
-		[self setCellWidth:DEFAULT_CELL_WIDTH];
+		_movedUrls = [[NSMutableArray alloc] init];
+		_originPaths = [[NSMutableArray alloc] init];
+		// cellWidth should be initialized by an external controller during awakeFromNib
+		_maxCellWidth = FLT_MAX;
 		textHeight = DEFAULT_TEXTHEIGHT;
 		autoRotate = YES;
-		loadingImage = [NSImage imageNamed:@"loading.png"];
 		
 		[self registerForDraggedTypes:@[NSFilenamesPboardType]];
-		
-		[[NSThread currentThread] threadDictionary][@"DYWrappingMatrixMainThread"] = @"1";
 	}
 	return self;
 }
 
 - (void)awakeFromNib {
-	[[self enclosingScrollView] setPostsFrameChangedNotifications:YES];
-	[[NSNotificationCenter defaultCenter] addObserver:self
+	[self.enclosingScrollView setPostsFrameChangedNotifications:YES];
+	[NSNotificationCenter.defaultCenter addObserver:self
 											 selector:@selector(resize:)
 												 name:NSViewFrameDidChangeNotification
-											   object:[self enclosingScrollView]];
-	bgColor = [[NSUnarchiver unarchiveObjectWithData:
-		[[NSUserDefaults standardUserDefaults] dataForKey:@"DYWrappingMatrixBgColor"]]
-		retain];
-	[[NSUserDefaultsController sharedUserDefaultsController] addObserver:self
+											   object:self.enclosingScrollView];
+	[self.enclosingScrollView.contentView setPostsBoundsChangedNotifications:YES];
+	NSUserDefaults *udf = NSUserDefaults.standardUserDefaults;
+	float padding = [udf floatForKey:@"thumbPadding"];
+	_vPadding = _hPadding = padding < 0 ? 0 : padding > PADDING ? PADDING : padding;
+	NSData *colorData = [udf dataForKey:@"DYWrappingMatrixBgColor"];
+	NSColor *aColor = [NSKeyedUnarchiver unarchivedObjectOfClass:[NSColor class] fromData:colorData error:NULL];
+	if (aColor == nil) {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+		aColor = [NSUnarchiver unarchiveObjectWithData:colorData];
+#pragma GCC diagnostic pop
+		NSData *migratedData = [NSKeyedArchiver archivedDataWithRootObject:aColor requiringSecureCoding:YES error:NULL];
+		[udf setObject:migratedData forKey:@"DYWrappingMatrixBgColor"];
+	}
+	bgColor = aColor;
+	[NSUserDefaultsController.sharedUserDefaultsController addObserver:self
 															  forKeyPath:@"values.DYWrappingMatrixMaxCellWidth"
 																 options:NSKeyValueObservingOptionNew
 																 context:NULL];
-	[[NSUserDefaultsController sharedUserDefaultsController] addObserver:self
+	[NSUserDefaultsController.sharedUserDefaultsController addObserver:self
 															  forKeyPath:@"values.DYWrappingMatrixBgColor"
 																 options:NSKeyValueObservingOptionNew
 																 context:NULL];
+	_respondsToLoadImageForFile = [delegate respondsToSelector:@selector(wrappingMatrixWantsImageForFile:atIndex:)];
+	_respondsToSelectionDidChange = [delegate respondsToSelector:@selector(wrappingMatrixSelectionDidChange:)];
+	_appDelegate = NSApp.delegate;
 }
 
 - (void)setMaxCellWidth:(float)w {
-	//do nothing
+	if (w < _maxCellWidth) {
+		_maxCellWidth = w; // this has to be set before we do the resizing
+		self.cellWidth = cellWidth < w ? cellWidth : w;
+	} else {
+		_maxCellWidth = w;
+		// tell delegate to reload anything we've loaded already
+		// the delay is to wait for all the other windows to have emptied the thumbs cache before we start repopulating it
+		NSUInteger n = filenames.count;
+		if (n && _respondsToLoadImageForFile) dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+			for (NSUInteger i = 0; i < n; ++i) {
+				if (images[i] != loadingImage)
+					[delegate wrappingMatrixWantsImageForFile:filenames[i] atIndex:i];
+			}
+		});
+	}
 }
 - (void)observeValueForKeyPath:(NSString *)keyPath
 					  ofObject:(id)object 
@@ -215,25 +228,18 @@ static NSRect ScaledCenteredRect(NSSize sourceSize, NSRect boundsRect) {
                        context:(void *)context
 {
     if ([keyPath isEqual:@"values.DYWrappingMatrixMaxCellWidth"]) {
-		[self setMaxCellWidth:[[NSUserDefaults standardUserDefaults] integerForKey:@"DYWrappingMatrixMaxCellWidth"]];
+		self.maxCellWidth = [NSUserDefaults.standardUserDefaults integerForKey:@"DYWrappingMatrixMaxCellWidth"];
 	} else if ([keyPath isEqualToString:@"values.DYWrappingMatrixBgColor"]) {
-		[bgColor release];
-		bgColor = [[NSUnarchiver unarchiveObjectWithData:[[NSUserDefaults standardUserDefaults] dataForKey:@"DYWrappingMatrixBgColor"]] retain];
+		bgColor = [NSKeyedUnarchiver unarchivedObjectOfClass:[NSColor class] fromData:[NSUserDefaults.standardUserDefaults dataForKey:@"DYWrappingMatrixBgColor"] error:NULL];
 		[self setNeedsDisplay];
 	}
 }
 
 - (void)dealloc {
-	[[NSNotificationCenter defaultCenter] removeObserver:self];
-	[myCell release];
-	[myTextCell release];
-	[images release];
-	[filenames release];
-	[selectedIndexes release];
-	[requestedFilenames release];
-	[bgColor release];
-	[_openWithAppIdentifiers release];
-	[super dealloc];
+	NSUserDefaultsController *u = NSUserDefaultsController.sharedUserDefaultsController;
+	[u removeObserver:self forKeyPath:@"values.DYWrappingMatrixMaxCellWidth"];
+	[u removeObserver:self forKeyPath:@"values.DYWrappingMatrixBgColor"];
+	[NSNotificationCenter.defaultCenter removeObserver:self];
 }
 
 - (BOOL)acceptsFirstResponder { return YES; }
@@ -241,28 +247,30 @@ static NSRect ScaledCenteredRect(NSSize sourceSize, NSRect boundsRect) {
 - (BOOL)isFlipped { return YES; }
 
 #pragma mark display/drag stuff
-- (NSSize)cellSize { return NSMakeSize(cellWidth,cellWidth*3/4); }
 - (float)maxCellWidth {
-	return [[NSUserDefaults standardUserDefaults] integerForKey:@"DYWrappingMatrixMaxCellWidth"];
+	return _maxCellWidth;
 }
 - (float)minCellWidth { return MIN_CELL_WIDTH; }
 - (float)cellWidth { return cellWidth; }
 - (void)setCellWidth:(float)w {
+	if (w < MIN_CELL_WIDTH) w = MIN_CELL_WIDTH;
+	else if (w > _maxCellWidth) w = _maxCellWidth;
+	if (cellWidth == w) return;
 	cellWidth = w;
 	[self resize:nil];
-	[self setNeedsDisplay:YES]; // ** I suppose should call on main thread too
+	[self setNeedsDisplay:YES];
 }
 
 
 - (void)calculateCellSizes {
 	// all values dependent on bounds width, cellWidth(, numCells for resize:)
-	float self_w = [self bounds].size.width;
+	float self_w = self.bounds.size.width;
 	cellHeight = cellWidth*3/4;
-	numCols = (int)(self_w)/((int)cellWidth + PADDING/2);
+	numCols = (int)(self_w)/((int)cellWidth + _hPadding/2);
 	if (numCols == 0) numCols = 1;
 	columnSpacing = (self_w - numCols*cellWidth)/numCols;
 	area_w = cellWidth + columnSpacing;
-	area_h = cellHeight + VERTPADDING + textHeight;
+	area_h = cellHeight + _vPadding + textHeight;
 }
 - (NSInteger)point2cellnum:(NSPoint)p {
 	NSInteger col = MIN(numCols-1, (NSInteger)p.x/area_w); if (col < 0) col = 0;
@@ -271,7 +279,7 @@ static NSRect ScaledCenteredRect(NSSize sourceSize, NSRect boundsRect) {
 	return n; // n might be > numCells-1
 }
 - (NSRect)cellnum2rect:(NSUInteger)n {
-	int row, col;
+	NSUInteger row, col;
 	row = n/numCols;
 	col = n%numCols;
 	return NSMakeRect(area_w*col,area_h*row,area_w, area_h);
@@ -282,7 +290,7 @@ static NSRect ScaledCenteredRect(NSSize sourceSize, NSRect boundsRect) {
 	col = n%numCols;
 	return ScaledCenteredRect([self imageSizeForIndex:n],
 							  NSMakeRect(cellWidth*col + columnSpacing*(col + 0.5),
-										 (cellHeight+textHeight)*row + VERTPADDING*(row+0.5),
+										 (cellHeight+textHeight)*row + _vPadding*(row+0.5),
 										 cellWidth, cellHeight)); // rect for cell only
 }
 
@@ -304,33 +312,39 @@ static NSRect ScaledCenteredRect(NSSize sourceSize, NSRect boundsRect) {
 										   x+area_w-x2,r.size.height)]; // right
 }
 
-- (NSDragOperation)draggingSourceOperationMaskForLocal:(BOOL)isLocal {
-	if (isLocal) return NSDragOperationNone;
+#pragma mark NSDraggingSource stuff
+- (NSDragOperation)draggingSession:(NSDraggingSession *)session sourceOperationMaskForDraggingContext:(NSDraggingContext)context {
+	if (context == NSDraggingContextWithinApplication) return NSDragOperationNone;
 	unsigned int o = NSDragOperationGeneric | NSDragOperationDelete | NSDragOperationCopy;
-	if ([[NSUserDefaults standardUserDefaults] boolForKey:@"DYWrappingMatrixAllowMove"])
+	if ([NSUserDefaults.standardUserDefaults boolForKey:@"DYWrappingMatrixAllowMove"])
 		o |= NSDragOperationLink | NSDragOperationMove;
 	// NSDragOperationLink creates aliases in the finder
 	return o;
-	
-	// Note: You CANNOT check the currentEvent for modifier flags here to
-	// change the kind of dragging operation to the Finder. This is because
-	// the Finder seems to only remember the first return value from this
-	// function, even though it happens to get called over and over again.
-	// i.e., later invocations of this function return the value that you tell
-	// it to, but the Finder just ignores it. This means you only get the
-	// desired behavior when the user holds down the option key _before_
-	// the dragging starts, which is not good user interface.
 }
 
-- (void)draggedImage:(NSImage *)anImage endedAt:(NSPoint)aPoint operation:(NSDragOperation)operation {
-	// ** hm, how to best talk to the right object?
+- (void)draggingSession:(NSDraggingSession *)session movedToPoint:(NSPoint)screenPoint {
+	session.draggingFormation = NSDraggingFormationPile;
+}
+
+- (void)draggingSession:(NSDraggingSession *)session endedAtPoint:(NSPoint)aPoint operation:(NSDragOperation)operation {
 	if (operation == NSDragOperationDelete) {
-		if ([(CreeveyController *)[NSApp delegate] respondsToSelector:@selector(moveToTrash:)])
-			[(CreeveyController *)[NSApp delegate] moveToTrash:nil];
+		if ([_appDelegate respondsToSelector:@selector(moveToTrash:)])
+			[_appDelegate moveToTrash:nil];
 	} else if (operation == NSDragOperationMove) {
-		if ([(CreeveyController *)[NSApp delegate] respondsToSelector:@selector(moveElsewhere:)])
-			[(CreeveyController *)[NSApp delegate] moveElsewhere:nil];
+		if ([_appDelegate respondsToSelector:@selector(moveElsewhere)])
+			[_appDelegate moveElsewhere];
 	}
+	// moveElsewhere should have retained copies of these, so OK to reset them now
+	[_movedUrls removeAllObjects];
+	[_originPaths removeAllObjects];
+}
+
+- (NSArray<NSURL *> *)movedUrls {
+	return [_movedUrls copy];
+}
+
+- (NSArray<NSString *> *)originPaths {
+	return [_originPaths copy];
 }
 
 #pragma mark filename stuff
@@ -340,7 +354,7 @@ static NSRect ScaledCenteredRect(NSSize sourceSize, NSRect boundsRect) {
 }
 - (void)setShowFilenames:(BOOL)b {
 	// preserve the scrollpoint relative to the top left visible thumbnail
-	NSPoint mouseLoc = [self convertPoint:NSMakePoint(1, 1) fromView:[self enclosingScrollView]]; // for some reason NSZeroPoint isn't quite right...
+	NSPoint mouseLoc = [self convertPoint:NSMakePoint(1, 1) fromView:self.enclosingScrollView]; // for some reason NSZeroPoint isn't quite right...
 	NSInteger row = (NSInteger)mouseLoc.y/area_h;
 	float dy = mouseLoc.y - area_h*row;
 
@@ -357,20 +371,42 @@ static NSRect ScaledCenteredRect(NSSize sourceSize, NSRect boundsRect) {
 	[self scrollPoint:NSMakePoint(0, row*area_h + dy)];
 }
 
+#pragma mark menu stuff
+
+- (BOOL)validateMenuItem:(NSMenuItem *)menuItem {
+	if (menuItem.action == @selector(copy:)) return selectedIndexes.count > 0;
+	// selectAll:/selectNone:
+	return filenames.count > 0;
+}
+
+- (IBAction)copy:(id)sender {
+	NSMutableArray *items = [NSMutableArray arrayWithCapacity:selectedIndexes.count];
+	[selectedIndexes enumerateIndexesUsingBlock:^(NSUInteger idx, BOOL *stop) {
+		NSString *path = filenames[idx];
+		NSPasteboardItem *pbi = [[NSPasteboardItem alloc] init];
+		[pbi setString:path forType:NSPasteboardTypeString];
+		[pbi setString:[NSURL fileURLWithPath:path isDirectory:NO].absoluteString  forType:NSPasteboardTypeFileURL];
+		[items addObject:pbi];
+	}];
+	NSPasteboard *pb = NSPasteboard.generalPasteboard;
+	[pb clearContents];
+	[pb writeObjects:items];
+}
+
 #pragma mark event stuff
 - (void)mouseDown:(NSEvent *)theEvent {
-	[[self window] makeFirstResponder:self];
+	[self.window makeFirstResponder:self];
+	if (numCells == 0) return;
 	BOOL keepOn = YES;
 	char doDrag = 0;
-	NSUInteger cellNum, a, b, i;
+	NSUInteger cellNum, a, b;
 	NSRange draggedRange;
 	NSMutableIndexSet *oldSelection = [selectedIndexes mutableCopy];
 	NSMutableIndexSet *lastIterationSelection = [oldSelection mutableCopy];
-	BOOL shiftKeyDown = ([theEvent modifierFlags] & NSShiftKeyMask) != 0;
-	BOOL cmdKeyDown = ([theEvent modifierFlags] & NSCommandKeyMask) != 0;
+	BOOL shiftKeyDown = (theEvent.modifierFlags & NSEventModifierFlagShift) != 0;
+	BOOL cmdKeyDown = (theEvent.modifierFlags & NSEventModifierFlagCommand) != 0;
 
-	NSPoint mouseLoc = [self convertPoint:[theEvent locationInWindow] fromView:nil];
-	NSPoint mouseDownLoc = mouseLoc;
+	NSPoint mouseLoc = [self convertPoint:theEvent.locationInWindow fromView:nil];
 	NSUInteger mouseDownCellNum = [self point2cellnum:mouseLoc];
 	if (![selectedIndexes containsIndex:mouseDownCellNum] && !shiftKeyDown && !cmdKeyDown) {
 		[oldSelection removeAllIndexes];
@@ -383,20 +419,20 @@ static NSRect ScaledCenteredRect(NSSize sourceSize, NSRect boundsRect) {
 		doDrag = 1;
 	} else if (shiftKeyDown) {
 		// if shift key is down, it's as if we had dragged from the end of the old selection
-		mouseDownCellNum = mouseDownCellNum < [selectedIndexes lastIndex]
-			? [selectedIndexes firstIndex]
-			: [selectedIndexes lastIndex];
+		mouseDownCellNum = mouseDownCellNum < selectedIndexes.lastIndex
+			? selectedIndexes.firstIndex
+			: selectedIndexes.lastIndex;
 	}
 	[NSEvent startPeriodicEventsAfterDelay:0 withPeriod:0.3];
     while (1) {
-		mouseLoc = [theEvent locationInWindow];
-        switch ([theEvent type]) {
-			case NSPeriodic: // NOT nsperiodicmask, duh
-				mouseLoc = [[self window] mouseLocationOutsideOfEventStream];
-			case NSLeftMouseDown: // for the first iteration only
-            case NSLeftMouseDragged:
+		mouseLoc = theEvent.locationInWindow;
+        switch (theEvent.type) {
+			case NSEventTypePeriodic:
+				mouseLoc = self.window.mouseLocationOutsideOfEventStream;
+			case NSEventTypeLeftMouseDown: // for the first iteration only
+			case NSEventTypeLeftMouseDragged:
 				mouseLoc = [self convertPoint:mouseLoc fromView:nil];
-				if (doDrag && [theEvent type] == NSLeftMouseDragged) {
+				if (doDrag && theEvent.type == NSEventTypeLeftMouseDragged) {
 					doDrag = 2;
 					keepOn = NO;
 					break;
@@ -417,124 +453,124 @@ static NSRect ScaledCenteredRect(NSSize sourceSize, NSRect boundsRect) {
 				if (shiftKeyDown || !cmdKeyDown) // shift or no modifiers
 					[selectedIndexes addIndexesInRange:draggedRange];
 				else
-					for (i=0; i<draggedRange.length; ++i)
+					for (NSUInteger i=0; i<draggedRange.length; ++i)
 						if ([selectedIndexes containsIndex:draggedRange.location+i])
 							[selectedIndexes removeIndex:draggedRange.location+i];
 						else
 							[selectedIndexes addIndex:draggedRange.location+i];
-				if (![self mouse:mouseLoc inRect:[self visibleRect]])
+				if (![self mouse:mouseLoc inRect:self.visibleRect])
 					[self autoscroll:theEvent]; // always check visibleRect for autoscroll
 				[lastIterationSelection symmetricDifference:selectedIndexes];
-				if ([lastIterationSelection count]) {
-					// if selection changed...
-					[self updateStatusString];
-					for (i=[lastIterationSelection firstIndex]; i != NSNotFound; i = [lastIterationSelection indexGreaterThanIndex:i]) {
+				if (lastIterationSelection.count) {
+					[self notifySelectionDidChange];
+					for (NSUInteger i=lastIterationSelection.firstIndex; i != NSNotFound; i = [lastIterationSelection indexGreaterThanIndex:i]) {
 						[self selectionNeedsDisplay:i];
 					}
 				}
 				[lastIterationSelection removeAllIndexes];
 				[lastIterationSelection addIndexes:selectedIndexes];
 				break;
-            case NSLeftMouseUp:
-				if ([theEvent clickCount] == 2
+			case NSEventTypeLeftMouseUp:
+				if (theEvent.clickCount == 2
 					&& mouseDownCellNum < numCells
 					&& !shiftKeyDown && !cmdKeyDown)
-					[self sendAction:[self action] to:[self target]];
+					[self sendAction:self.action to:self.target];
 				keepOn = NO;
 				break;
             default:
 				break;
         }
 		if (!keepOn) break;
-        theEvent = [[self window] nextEventMatchingMask:
-			NSLeftMouseUpMask | NSLeftMouseDraggedMask | NSPeriodicMask];
+        theEvent = [self.window nextEventMatchingMask:
+					NSEventMaskLeftMouseUp | NSEventMaskLeftMouseDragged | NSEventMaskPeriodic];
     }
 	[NSEvent stopPeriodicEvents];
 	if (doDrag == 2) {
-		//pboard
-		NSPasteboard *pboard = [NSPasteboard pasteboardWithName:NSDragPboard];
-		[pboard declareTypes:@[NSFilenamesPboardType] owner:nil];
-		[pboard setPropertyList:[filenames objectsAtIndexes:selectedIndexes]
-						forType:NSFilenamesPboardType];
-		//loc, img
-		NSImage *dragImg, *transparentImg;
-		NSPoint imgLoc = mouseDownLoc;
-		NSSize imgSize;
-		if ([selectedIndexes count] == 1) {
-			dragImg = [self imageForIndex:[selectedIndexes firstIndex]];
-			NSRect imgRect = [self imageRectForIndex:mouseDownCellNum];
-			imgSize = imgRect.size;
-			imgLoc = imgRect.origin;
-			imgLoc.y += imgRect.size.height;
-		} else {
-			dragImg = [NSImage imageNamed:@"multipledocs"];
-			imgSize = [dragImg size];
-			imgLoc.x -= [dragImg size].width/2;
-			imgLoc.y += [dragImg size].height/2; // we're using flipped coords, calc bottom left
-		}
-		transparentImg = [[[NSImage alloc] initWithSize:imgSize] autorelease];
-		[transparentImg lockFocus];
-		[dragImg drawInRect:NSMakeRect(0,0,imgSize.width,imgSize.height)
-				   fromRect:NSMakeRect(0,0,[dragImg size].width,[dragImg size].height)
-				  operation:NSCompositeCopy fraction:0.3];
-		[transparentImg unlockFocus];
-		[self dragImage:transparentImg
-					 at:imgLoc
-				 offset:NSMakeSize(mouseLoc.x - mouseDownLoc.x,
-								   -(mouseLoc.y - mouseDownLoc.y))
-				  event:theEvent
-			 pasteboard:pboard source:self slideBack:YES];
+		NSMutableArray *draggingItems = [NSMutableArray arrayWithCapacity:selectedIndexes.count];
+		[selectedIndexes enumerateIndexesUsingBlock:^(NSUInteger idx, BOOL * _Nonnull stop) {
+			NSString *path = filenames[idx];
+			NSURL *url = [NSURL fileURLWithPath:path isDirectory:NO];
+			[_originPaths addObject:path];
+			[_movedUrls addObject:url.fileReferenceURL];
+			NSPasteboardItem *pbi = [[NSPasteboardItem alloc] init];
+			[pbi setString:url.absoluteString forType:NSPasteboardTypeFileURL];
+			NSDraggingItem *item = [[NSDraggingItem alloc] initWithPasteboardWriter:pbi];
+			// set an image to be dragged
+			// for performance reasons we use a block as an imagecomponentprovider rather than actual nsimages
+			// contrary to the documentation, the imageComponentsProvider is a block that returns an array, not an array of blocks
+			NSRect imageRect = [self imageRectForIndex:idx];
+			NSImage *image = images[idx]; // the block should capture a ref to the image, not to our images array
+			unsigned short eo = [self exifOrientationForIndex:idx];
+			item.draggingFrame = imageRect;
+			imageRect.origin = NSZeroPoint; // origin must be zero for the block to work correctly
+			item.imageComponentsProvider = ^NSArray<NSDraggingImageComponent *> * _Nonnull {
+				NSDraggingImageComponent *c = [NSDraggingImageComponent draggingImageComponentWithKey:NSDraggingImageComponentIconKey];
+				c.frame = imageRect;
+				NSImage *contents;
+				if (eo > 1) {
+					CGFloat r = 0; BOOL imgFlipped = NO;
+					switch (eo) {
+						case 5: imgFlipped = YES; case 8: r = 90; break;
+						case 7: imgFlipped = YES; case 6: r = -90; break;
+						case 3: r = 180; break;
+						case 4: r = 180; case 2: imgFlipped = YES; break;
+					}
+					NSSize oldSize = image.size;
+					NSSize newSize = eo >= 5 ? (NSSize){oldSize.height, oldSize.width} : oldSize;
+					// think of this transform in the new image's coordinates
+					NSAffineTransform *transform = [NSAffineTransform transform];
+					[transform translateXBy:newSize.width/2 yBy:newSize.height/2]; // move origin to center of new rect
+					[transform rotateByDegrees:r]; // rotate our coordinate system
+					if (imgFlipped) [transform scaleXBy:-1 yBy:1];
+					[transform translateXBy:-oldSize.width/2 yBy:-oldSize.height/2]; // set origin to where the image will be drawn
+					contents = [[NSImage alloc] initWithSize:newSize];
+					[contents lockFocus];
+					[transform concat];
+					[image drawAtPoint:NSZeroPoint fromRect:NSZeroRect operation:NSCompositingOperationCopy fraction:1.0];
+					[contents unlockFocus];
+				} else {
+					contents = image;
+				}
+				c.contents = contents;
+				return @[c];
+			};
+			[draggingItems addObject:item];
+		}];
+		[self beginDraggingSessionWithItems:draggingItems event:theEvent source:self];
 	}
-	[oldSelection release];
-	[lastIterationSelection release];
 }
 
 - (void)resize:(id)anObject { // called by notification center
 	[self calculateCellSizes];
-	NSSize mySize = [self frame].size;
+	NSSize mySize = self.frame.size;
 	NSUInteger numRows = numCells == 0 ? 0 : (numCells-1)/numCols + 1;
-	float h = MAX(numRows*area_h, [[self superview] frame].size.height);
+	float h = MAX(floorf(numRows*area_h), [[self superview] frame].size.height);
 	if (mySize.height != h) {
 		mySize.height = h;
-		[self setFrameSize:mySize];
+		_contentSize = mySize;
 		[self invalidateIntrinsicContentSize];
 	}
 }
 
 - (NSSize)intrinsicContentSize
 {
-	return self.frame.size;
-}
-
-// always call this if called from another thread
-// calling from main seems to make drawing weird
-- (void)setNeedsDisplayInRect2:(NSRect)invalidRect {
-//	if ([[[NSThread currentThread] threadDictionary] objectForKey:@"DYWrappingMatrixMainThread"])
-//		[super setNeedsDisplayInRect:(NSRect)invalidRect];
-//	else
-		[self performSelectorOnMainThread:@selector(setNeedsDisplayInRectThreaded:)
-							   withObject:[NSValue valueWithRect:invalidRect]
-							waitUntilDone:NO];
-}
-
-- (void)setNeedsDisplayInRectThreaded:(NSValue *)v {
-	[self setNeedsDisplayInRect:[v rectValue]];
+	return _contentSize;
 }
 
 - (void)drawRect:(NSRect)rect {
-	NSGraphicsContext *cg = [NSGraphicsContext currentContext];
-	NSImageInterpolation oldInterp = [cg imageInterpolation];
-	[cg setImageInterpolation:NSImageInterpolationNone];
+	NSGraphicsContext *cg = NSGraphicsContext.currentContext;
+	NSImageInterpolation oldInterp = cg.imageInterpolation;
+	cg.imageInterpolation = NSImageInterpolationNone;
 	
 	[bgColor set];
 	[NSBezierPath fillRect:rect];
-	//NSLog(@"---------------------------");
 	NSUInteger i, row, col;
 	NSRect areaRect = NSMakeRect(0, 0, area_w, area_h);
-	NSRect textCellRect = NSMakeRect(0, 0, area_w, textHeight + VERTPADDING/2);
+	NSRect textCellRect = NSMakeRect(0, 0, area_w, textHeight + _vPadding/2);
 	NSRect cellRect;
-	NSWindow *myWindow = [self window];
-	[myTextCell setFont:[NSFont systemFontOfSize:cellWidth >= 160 ? 12 : 4+cellWidth/20]]; // ranges from 6 to 12: 6 + 6*(cellWidth-40)/(160-40)
+	NSWindow *myWindow = self.window;
+	myTextCell.font = [NSFont systemFontOfSize:cellWidth >= 160 ? 12 : 4+cellWidth/20]; // ranges from 6 to 12: 6 + 6*(cellWidth-40)/(160-40)
+	myTextCell.textColor = bgColor.bestTextColor;
 	for (i=0; i<numCells; ++i) {
 		row = i/numCols;
 		col = i%numCols;
@@ -542,32 +578,30 @@ static NSRect ScaledCenteredRect(NSSize sourceSize, NSRect boundsRect) {
 		if (![self needsToDrawRect:areaRect]) continue;
 		// color the selection
 		if ([selectedIndexes containsIndex:i]) {
-			[([myWindow firstResponder] == self && [myWindow isKeyWindow]
-			  ? [NSColor selectedTextBackgroundColor]
-			  : [NSColor lightGrayColor]) set];
+			[(myWindow.firstResponder == self && myWindow.keyWindow
+			  ? NSColor.selectedTextBackgroundColor
+			  : NSColor.lightGrayColor) set];
 			[NSBezierPath fillRect:areaRect];
 		}
 		// retrieve the image, or ask the delegate to load it and send it back if it hasn't been set yet
 		NSImage *img = images[i];
 		NSString *filename = filenames[i];
 		if (img == loadingImage) {
-			if ([delegate respondsToSelector:@selector(wrappingMatrix:loadImageForFile:atIndex:)]
-				&& ![requestedFilenames containsObject:filename]) {
-				NSImage *newImage = [delegate wrappingMatrix:self loadImageForFile:filename atIndex:i];
+			if (_respondsToLoadImageForFile && ![requestedFilenames containsObject:filename]) {
+				NSImage *newImage = [delegate wrappingMatrixWantsImageForFile:filename atIndex:i];
 				if (newImage) {
 					images[i] = newImage;
 					img = newImage;
-					++numThumbsLoaded;
 				} else {
 					[requestedFilenames addObject:filename];
 				}
 			}
 		}
-		[myCell setImage:img];//[self imageForIndex:i]];//
+		myCell.image = img;
 		// calculate drawing area for thumb and filename area
 		if (textHeight) {
 			textCellRect.origin.x = areaRect.origin.x;
-			textCellRect.origin.y = areaRect.origin.y + area_h - textHeight - VERTPADDING/2;
+			textCellRect.origin.y = areaRect.origin.y + area_h - textHeight - _vPadding/2;
 		}
 		cellRect = [self imageRectForIndex:i];
 		if (![self needsToDrawRect:cellRect] &&
@@ -576,12 +610,9 @@ static NSRect ScaledCenteredRect(NSSize sourceSize, NSRect boundsRect) {
 			//NSLog(@"skipped cell %i", i);
 			continue;
 		}
-		[[NSColor whiteColor] set]; // white bg for transparent imgs
-		NSRectFill(cellRect);
+		[NSColor.whiteColor set]; // white bg for transparent imgs
+		NSRectFill(NSInsetRect(NSIntegralRectWithOptions(cellRect, NSAlignAllEdgesNearest), 1.0, 1.0));
 		if (autoRotate) {
-			// this code is awfully similar to the NSImage category above,
-			// but I figure it's more time and memory efficient to draw directly to the view
-			// rather than generating a new NSImage every time you want to draw
 			unsigned short orientation = [self exifOrientationForIndex:i];
 			int r = 0; BOOL imgFlipped = NO;
 			switch (orientation) {
@@ -591,12 +622,11 @@ static NSRect ScaledCenteredRect(NSSize sourceSize, NSRect boundsRect) {
 				case 3: r = 180; break;
 			}
 			NSAffineTransform *transform = [NSAffineTransform transform];
-			[transform translateXBy:cellRect.origin.x+cellRect.size.width/2
-								yBy:cellRect.origin.y+cellRect.size.height/2];
+			CGFloat tx = cellRect.origin.x+cellRect.size.width/2, ty = cellRect.origin.y+cellRect.size.height/2;
+			[transform translateXBy:tx yBy:ty];
 			[transform rotateByDegrees:r];
 			if (imgFlipped) [transform scaleXBy:-1 yBy:1];
-			[transform translateXBy:-cellRect.origin.x-cellRect.size.width/2
-								yBy:-cellRect.origin.y-cellRect.size.height/2];
+			[transform translateXBy:-tx yBy:-ty];
 			[transform concat];
 			NSRect cellRect2 = cellRect;
 			if (orientation >= 5) {
@@ -617,28 +647,44 @@ static NSRect ScaledCenteredRect(NSSize sourceSize, NSRect boundsRect) {
 		}
 		
 		if (textHeight) {
-			[myTextCell setStringValue:[filenames[i] lastPathComponent]];
+			myTextCell.stringValue = filename.lastPathComponent;
 			[myTextCell drawInteriorWithFrame:textCellRect inView:self];
 		}
 	}
 	if (dragEntered) {
-		[[[NSColor lightGrayColor] colorWithAlphaComponent:0.5] set];
+		[[NSColor.lightGrayColor colorWithAlphaComponent:0.5] set];
 		[NSBezierPath fillRect:rect];
 	}
-	[cg setImageInterpolation:oldInterp];
+	cg.imageInterpolation = oldInterp;
 }
 - (void)scrollSelectionToVisible:(NSUInteger)n {
-	[self updateStatusString];
+	[self notifySelectionDidChange];
 	NSRect r = [self cellnum2rect:n];
 	[self selectionNeedsDisplay:n];
 	// round down for better auto-scrolling
 	r.size.height = (int)r.size.height;
-	if (![self mouse:r.origin inRect:[self visibleRect]])
+	if (![self mouse:r.origin inRect:self.visibleRect])
 		[self scrollRectToVisible:r];
 }
+- (void)scrollToFirstSelected:(NSIndexSet *)x {
+	[selectedIndexes addIndexes:x];
+	[selectedIndexes enumerateIndexesUsingBlock:^(NSUInteger i, BOOL * _Nonnull stop) {
+		[self selectionNeedsDisplay:i];
+	}];
+	NSRect r = [self cellnum2rect:x.firstIndex];
+	if (selectedIndexes.count > 1) {
+		// scroll such that the first selected thumb is a little bit below the top of the view
+		CGFloat scrollHeight = self.visibleRect.size.height - 30;
+		r.size.height = r.size.height > scrollHeight ? r.size.height : scrollHeight;
+	}
+	r.size.height = (int)r.size.height;
+	[self scrollRectToVisible:r];
+	[self notifySelectionDidChange];
+}
+
 - (void)keyDown:(NSEvent *)e {
-	if ([[e characters] length] == 0) return;
-	unichar c = [[e characters] characterAtIndex:0];
+	if (e.characters.length == 0) return;
+	unichar c = [e.characters characterAtIndex:0];
 	NSRect r;
 	switch (c) {
 		case NSHomeFunctionKey:
@@ -647,7 +693,7 @@ static NSRect ScaledCenteredRect(NSSize sourceSize, NSRect boundsRect) {
 			[self scrollRectToVisible:r];
 			return;
 		case NSEndFunctionKey:
-			r = [self cellnum2rect:[filenames count]-1];
+			r = [self cellnum2rect:filenames.count-1];
 			r.size.height = (int)r.size.height;
 			[self scrollRectToVisible:r];
 			return;
@@ -661,8 +707,8 @@ static NSRect ScaledCenteredRect(NSSize sourceSize, NSRect boundsRect) {
 			return;
 	}
 	NSUInteger n;
-	if ([selectedIndexes count] == 1) {
-		n = [selectedIndexes firstIndex];
+	if (selectedIndexes.count == 1) {
+		n = selectedIndexes.firstIndex;
 		[self selectionNeedsDisplay:n];
 		switch (c) {
 			case NSRightArrowFunctionKey: if (n<numCells-1) n++; break;
@@ -678,7 +724,7 @@ static NSRect ScaledCenteredRect(NSSize sourceSize, NSRect boundsRect) {
 			default: break;
 		}
 		[selectedIndexes removeAllIndexes];
-	} else if ([selectedIndexes count] == 0) {
+	} else if (selectedIndexes.count == 0 && numCells > 0) {
 		switch (c) {
 			case NSRightArrowFunctionKey:
 			case NSDownArrowFunctionKey:
@@ -698,12 +744,17 @@ static NSRect ScaledCenteredRect(NSSize sourceSize, NSRect boundsRect) {
 
 - (void)selectIndex:(NSUInteger)i {
 	// redraw the old selection (assume this only gets called if single selection)
-	if ([selectedIndexes count])
-		[self selectionNeedsDisplay:[selectedIndexes firstIndex]];
+	if (selectedIndexes.count)
+		[self selectionNeedsDisplay:selectedIndexes.firstIndex];
 	
 	[selectedIndexes removeAllIndexes];
 	[selectedIndexes addIndex:i];
 	[self scrollSelectionToVisible:i];
+}
+
+- (void)magnifyWithEvent:(NSEvent *)event
+{
+	self.cellWidth = cellWidth * (1.0 + event.magnification);
 }
 
 #pragma mark auto-rotate stuff
@@ -724,13 +775,6 @@ static NSRect ScaledCenteredRect(NSSize sourceSize, NSRect boundsRect) {
 		[self setNeedsDisplayInRect:[self imageRectForIndex:i]];
 	}
 }
-- (NSImage *)imageForIndex:(NSUInteger)n {
-	if (autoRotate) {
-		return [images[n] rotateByExifOrientation:[self exifOrientationForIndex:n]];
-	} else {
-		return images[n];
-	}
-}
 - (NSSize)imageSizeForIndex:(NSUInteger)n {
 	NSSize s = [images[n] size];
 	if (autoRotate && [self exifOrientationForIndex:n] >= 5) {
@@ -742,9 +786,7 @@ static NSRect ScaledCenteredRect(NSSize sourceSize, NSRect boundsRect) {
 	return s;
 }
 - (unsigned short)exifOrientationForIndex:(NSUInteger)n {
-	DYImageInfo *i = [[(CreeveyController *)[NSApp delegate] thumbsCache]
-					  infoForKey:ResolveAliasToPath(filenames[n])];
-	return i ? i->exifOrientation : 0;
+	return [_appDelegate exifOrientationForFile:filenames[n]];
 }
 
 
@@ -763,7 +805,7 @@ static NSRect ScaledCenteredRect(NSSize sourceSize, NSRect boundsRect) {
 }
 
 - (NSString *)firstSelectedFilename {
-	return filenames[[selectedIndexes firstIndex]];
+	return filenames[selectedIndexes.firstIndex];
 }
 
 - (IBAction)selectAll:(id)sender {
@@ -772,99 +814,93 @@ static NSRect ScaledCenteredRect(NSSize sourceSize, NSRect boundsRect) {
 	for (i=0; i<numCells; ++i) {
 		[self selectionNeedsDisplay:i];
 	}
-	[self updateStatusString];
+	[self notifySelectionDidChange];
 }
 
 - (IBAction)selectNone:(id)sender {
-	[selectedIndexes removeAllIndexes];
-	NSUInteger i;
-	for (i=0; i<numCells; ++i) {
+	[selectedIndexes enumerateIndexesUsingBlock:^(NSUInteger i, BOOL *stop) {
 		[self selectionNeedsDisplay:i];
+	}];
+	[selectedIndexes removeAllIndexes];
+	[self notifySelectionDidChange];
+}
+
+- (void)selectFilenames:(NSArray *)arr comparator:(NSComparator)cmp {
+	NSMutableIndexSet *newIdxs = [[NSMutableIndexSet alloc] init];
+	NSRange r = {0,filenames.count};
+	for (NSString *s in arr) {
+		NSUInteger idx = [filenames indexOfObject:s inSortedRange:r options:0 usingComparator:cmp];
+		if (idx != NSNotFound)
+			[newIdxs addIndex:idx];
 	}
-	[self updateStatusString];
+	if (newIdxs.count) {
+		[selectedIndexes enumerateIndexesUsingBlock:^(NSUInteger i, BOOL *stop) {
+			[self selectionNeedsDisplay:i];
+		}];
+		[selectedIndexes removeAllIndexes];
+		[self scrollToFirstSelected:newIdxs];
+	}
 }
 
 - (NSUInteger)numCells {
 	return numCells;
 }
 
-- (void)addSelectedIndex:(NSUInteger)i {
-	[selectedIndexes addIndex:i];
-	[self setNeedsDisplayInRect2:[self cellnum2rect:i]];
-	[NSObject cancelPreviousPerformRequestsWithTarget:self
-											 selector:@selector(updateStatusString)
-											   object:nil];
-	[self performSelectorOnMainThread:@selector(updateStatusString)
-						   withObject:nil waitUntilDone:NO];
-	//[self updateStatusString];
-}
-
 // call this when an image changes (filename is already set)
-- (void)setImage:(NSImage *)theImage forIndex:(NSUInteger)i {
+- (void)updateImage:(NSImage *)theImage atIndex:(NSUInteger)i {
 	if (i >= numCells) return;
 	images[i] = theImage;
-	[self setNeedsDisplayInRect2:[self cellnum2rect:i]];
+	[self setNeedsDisplayInRect:[self cellnum2rect:i]];
 }
 
 #pragma mark lazy loading stuff
-- (void)setImageWithFileInfo:(NSDictionary *)d {
-	NSString *s = d[@"filename"];
+// called in main thread. returns YES if theImage has been retained
+- (BOOL)setImage:(NSImage *)theImage atIndex:(NSUInteger)i forFilename:(NSString *)s {
 	[requestedFilenames removeObject:s];
-	NSUInteger i = [d[@"index"] unsignedIntegerValue];
-	NSImage *theImage = d[@"image"];
-	if (i >= numCells) return;
+	if (i >= numCells) return NO;
 	if (![filenames[i] isEqualToString:s]) {
 		i = [filenames indexOfObject:s];
-		if (i == NSNotFound) return;
+		if (i == NSNotFound) return NO;
 	}
 	if (images[i] != theImage) {
 		images[i] = theImage;
-		++numThumbsLoaded;
-		[self setNeedsDisplayInRect2:[self cellnum2rect:i]];
-	}
-}
-
-- (BOOL)imageWithFileInfoNeedsDisplay:(NSDictionary *)d {
-	NSString *s = d[@"filename"];
-	if (![requestedFilenames containsObject:s]) return NO;
-	NSUInteger i = [d[@"index"] unsignedIntegerValue];
-	if (i >= numCells) return NO;
-	// simple check to see if nothing's changed and the rect is visible
-	if ([filenames[i] isEqualToString:s]) {
-		NSRect visibleRect = [self visibleRect];
-		NSRect cellRect = [self cellnum2rect:i];
-		NSPoint p = cellRect.origin;
-		if (NSPointInRect(p, visibleRect)) return YES;
-		p.x += cellRect.size.width - 1; // adjust these values by one point to make sure NSPointInRect handles the bottom right corner correctly
-		p.y += cellRect.size.height - 1;
-		return NSPointInRect(p, visibleRect);
+		[self setNeedsDisplayInRect:[self cellnum2rect:i]];
+		return YES;
 	}
 	return NO;
 }
 
-- (void)updateStatusString {
-	if ([delegate respondsToSelector:@selector(wrappingMatrix:selectionDidChange:)]) {
-		[delegate wrappingMatrix:self selectionDidChange:selectedIndexes];
-	}
+- (DYMatrixState *)currentState {
+	DYMatrixState *o = [[DYMatrixState alloc] init];
+	o->numCells = numCells;
+	o->numCols = numCols;
+	o->area_w = area_w;
+	o->area_h = area_h;
+	o->visibleRect = self.visibleRect;
+	o.filenames = filenames;
+	return o;
 }
 
-- (NSUInteger)numThumbsLoaded {
-	return numThumbsLoaded;
+- (void)notifySelectionDidChange {
+	if (_respondsToSelectionDidChange)
+		[delegate wrappingMatrixSelectionDidChange:selectedIndexes];
 }
 
 #pragma mark add/delete images stuff
 - (void)addImage:(NSImage *)theImage withFilename:(NSString *)s{
+	[self addImage:theImage withFilename:s atIndex:filenames.count];
+}
+
+- (void)addImage:(NSImage *)theImage withFilename:(NSString *)s atIndex:(NSUInteger)i {
 	if (!theImage)
 		theImage = loadingImage;
-	else
-		++numThumbsLoaded;
-	[images addObject:theImage];
-	[filenames addObject:s];
+	[images insertObject:theImage atIndex:i];
+	[filenames insertObject:s atIndex:i];
 	numCells++;
-	dispatch_async(dispatch_get_main_queue(), ^{
-		[self resize:nil];
-		[self setNeedsDisplayInRect:[self cellnum2rect:numCells-1]];
-	});
+	[self resize:nil];
+	do {
+		[self setNeedsDisplayInRect:[self cellnum2rect:i]];
+	} while (++i<numCells);
 }
 
 - (void)removeAllImages {
@@ -872,32 +908,16 @@ static NSRect ScaledCenteredRect(NSSize sourceSize, NSRect boundsRect) {
 	[images removeAllObjects];
 	[filenames removeAllObjects];
 	[requestedFilenames removeAllObjects];
-	numThumbsLoaded = 0;
-	dispatch_async(dispatch_get_main_queue(), ^{
-		[self resize:nil];
-		[self setNeedsDisplay:YES];
-		[self selectNone:nil];
-		// manually set to 0 to avoid animation (which you get if you call [self scrollPoint:]
-		[[[self enclosingScrollView] contentView] scrollToPoint:NSZeroPoint];
-		[[[self enclosingScrollView] verticalScroller] setDoubleValue:0];
-		// this will do for now, but we should really rethink the entire threading code
-	});
-}
-/*
-- (void)removeSelectedImages {
-	numCells -= [selectedIndexes count];
-	[images removeObjectsFromIndices:selectedIndexes];
 	[selectedIndexes removeAllIndexes];
+	[self resize:nil];
 	[self setNeedsDisplay:YES];
+	// manually set to 0 to avoid animation (which you get if you call [self scrollPoint:]
+	[self.enclosingScrollView.contentView scrollToPoint:NSZeroPoint];
+	self.enclosingScrollView.verticalScroller.doubleValue = 0;
 }
-*/
 - (void)removeImageAtIndex:(NSUInteger)i {
 	// check if i is in range
-	if (i >= [images count]) return;
-	// adjust numLoaded if necessary
-	if (images[i] != loadingImage) {
-		--numThumbsLoaded;
-	}
+	if (i >= images.count) return;
 	numCells--;
 	[images removeObjectAtIndex:i];
 	[requestedFilenames removeObject:filenames[i]];
@@ -908,7 +928,27 @@ static NSRect ScaledCenteredRect(NSSize sourceSize, NSRect boundsRect) {
 		[self setNeedsDisplayInRect:[self cellnum2rect:i]];
 	} while (++i<=numCells);
 	// use <=, not <, because we need to redraw the last cell, which has shifted
-	[self updateStatusString];
+	[self notifySelectionDidChange];
+}
+- (void)moveImageAtIndex:(NSUInteger)fromIdx toIndex:(NSUInteger)toIdx {
+	if (fromIdx == toIdx) return;
+	[images moveObjectAtIndex:fromIdx toIndex:toIdx];
+	[filenames moveObjectAtIndex:fromIdx toIndex:toIdx];
+	BOOL selected = [selectedIndexes containsIndex:fromIdx];
+	[selectedIndexes shiftIndexesStartingAtIndex:fromIdx+1 by:-1];
+	[selectedIndexes shiftIndexesStartingAtIndex:toIdx by:1];
+	if (selected) [selectedIndexes addIndex:toIdx];
+	if (fromIdx > toIdx) {
+		NSUInteger tmp = fromIdx;
+		fromIdx = toIdx;
+		toIdx = tmp;
+	}
+	do {
+		[self setNeedsDisplayInRect:[self cellnum2rect:fromIdx]];
+	} while (++fromIdx <= toIdx);
+}
+- (void)changeBase:(NSString *)basePath toPath:(NSString *)newBase {
+	[filenames changeBase:basePath toPath:newBase];
 }
 
 
@@ -917,10 +957,10 @@ static NSRect ScaledCenteredRect(NSSize sourceSize, NSRect boundsRect) {
     NSPasteboard *pboard;
     NSDragOperation sourceDragMask;
 	
-    sourceDragMask = [sender draggingSourceOperationMask];
-	pboard = [sender draggingPasteboard];
+    sourceDragMask = sender.draggingSourceOperationMask;
+	pboard = sender.draggingPasteboard;
 	
-    if ( [[pboard types] containsObject:NSFilenamesPboardType] ) {
+    if ( [pboard.types containsObject:NSFilenamesPboardType] ) {
         if (sourceDragMask & NSDragOperationGeneric) {
 			dragEntered = YES;
 			[self setNeedsDisplay:YES];
@@ -944,24 +984,20 @@ static NSRect ScaledCenteredRect(NSSize sourceSize, NSRect boundsRect) {
 - (BOOL)performDragOperation:(id <NSDraggingInfo>)sender {
     NSPasteboard *pboard;
     NSDragOperation sourceDragMask;
-    sourceDragMask = [sender draggingSourceOperationMask];
-    pboard = [sender draggingPasteboard];
-    if ( [[pboard types] containsObject:NSFilenamesPboardType] ) {
+    sourceDragMask = sender.draggingSourceOperationMask;
+    pboard = sender.draggingPasteboard;
+    if ( [pboard.types containsObject:NSFilenamesPboardType] ) {
         NSArray *files = [pboard propertyListForType:NSFilenamesPboardType];
 		
 
         if (sourceDragMask & NSDragOperationGeneric) {
 			
-            [(CreeveyMainWindowController *)[[self window] delegate] openFiles:files withSlideshow:NO]; // **
+            [(CreeveyMainWindowController *)self.window.delegate openFiles:files withSlideshow:NO]; // **
 			
         }
 		
     }
     return YES;
-}
-
-- (void)setDelegate:(id)d {
-	delegate = d; // NOT retained
 }
 
 #pragma mark contextual menu stuff
@@ -971,21 +1007,21 @@ static NSRect ScaledCenteredRect(NSSize sourceSize, NSRect boundsRect) {
 	NSInteger index = [sender.menu indexOfItem:sender];
 	if (index < 0 || index >= self.openWithAppIdentifiers.count) return;
 	NSString *appIdentifier = self.openWithAppIdentifiers[index];
-	NSArray *paths = [self selectedFilenames];
+	NSArray *paths = self.selectedFilenames;
 	NSMutableArray *urls = [NSMutableArray arrayWithCapacity:paths.count];
 	for (NSString *path in paths) {
-		[urls addObject:[NSURL fileURLWithPath:path]];
+		[urls addObject:[NSURL fileURLWithPath:path isDirectory:NO]];
 	}
-	[[NSWorkspace sharedWorkspace] openURLs:urls withAppBundleIdentifier:appIdentifier options:NSWorkspaceLaunchDefault additionalEventParamDescriptor:nil launchIdentifiers:NULL];
+	[NSWorkspace.sharedWorkspace openURLs:urls withAppBundleIdentifier:appIdentifier options:NSWorkspaceLaunchDefault additionalEventParamDescriptor:nil launchIdentifiers:NULL];
 	self.openWithAppIdentifiers = nil;
 }
 
 - (NSMenu *)menuForEvent:(NSEvent *)event
 {
-    id appDelegate = [NSApp delegate];
+    id appDelegate = NSApp.delegate;
     if (![appDelegate respondsToSelector:@selector(thumbnailContextMenu)]) return nil;
     if ([appDelegate thumbnailContextMenu] == nil) {
-        if (![[NSBundle mainBundle] loadNibNamed:@"ThumbnailContextMenu" owner:appDelegate topLevelObjects:NULL]) return nil;
+        if (![NSBundle.mainBundle loadNibNamed:@"ThumbnailContextMenu" owner:appDelegate topLevelObjects:NULL]) return nil;
     }
 	NSPoint mouseLoc = [self convertPoint:event.locationInWindow fromView:nil];
 	NSUInteger cellNum = [self point2cellnum:mouseLoc];
@@ -1003,16 +1039,25 @@ static NSRect ScaledCenteredRect(NSSize sourceSize, NSRect boundsRect) {
 			return nil;
 	}
 
-	NSString *firstFile = filenames[selectedIndexes.firstIndex];
-	NSArray *allApplications = [(NSArray *)LSCopyApplicationURLsForURL((CFURLRef)[NSURL fileURLWithPath:firstFile], kLSRolesViewer|kLSRolesEditor) autorelease];
+	NSURL *firstFile = [NSURL fileURLWithPath:filenames[selectedIndexes.firstIndex] isDirectory:NO];
+	NSArray *allApplications = (NSArray *)CFBridgingRelease(LSCopyApplicationURLsForURL((__bridge CFURLRef)firstFile, kLSRolesViewer|kLSRolesEditor));
 	NSMutableArray *filteredApplications = [NSMutableArray array];
-	NSString *selfIdentifier = [NSBundle mainBundle].bundleIdentifier;
-	NSWorkspace *ws = [NSWorkspace sharedWorkspace];
-	NSURL *defaultAppURL = [ws URLForApplicationToOpenURL:[NSURL fileURLWithPath:firstFile]];
+	NSString *selfIdentifier = NSBundle.mainBundle.bundleIdentifier;
+	NSWorkspace *ws = NSWorkspace.sharedWorkspace;
+	NSURL *defaultAppURL = [ws URLForApplicationToOpenURL:firstFile];
+	if (allApplications == nil || defaultAppURL == nil) {
+		// fail gracefully if the file is not openable
+		NSMenu *menu = [appDelegate thumbnailContextMenu];
+		NSMenu *openWithMenu = [[NSMenu alloc] init];
+		NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:NSLocalizedString(@"None Available", @"") action:NULL keyEquivalent:@""];
+		[openWithMenu addItem:item];
+		[menu itemAtIndex:0].submenu = openWithMenu;
+		return menu;
+	}
 	NSString *defaultIdentifier = [NSBundle bundleWithURL:defaultAppURL].bundleIdentifier;
 	NSMutableSet *appIdentifiers = [NSMutableSet setWithCapacity:allApplications.count]; // don't duplicate app identifiers
 	NSCountedSet *displayNames = [NSCountedSet setWithCapacity:allApplications.count]; // disambiguate identical display names if necessary
-	NSFileManager *fm = [NSFileManager defaultManager];
+	NSFileManager *fm = NSFileManager.defaultManager;
 	for (NSURL *app in allApplications) {
 		NSString *appIdentifier = [NSBundle bundleWithURL:app].bundleIdentifier;
 		if (appIdentifier.length == 0 || [appIdentifier isEqualToString:selfIdentifier] || [appIdentifier isEqualToString:defaultIdentifier])
@@ -1023,6 +1068,8 @@ static NSRect ScaledCenteredRect(NSSize sourceSize, NSRect boundsRect) {
 			[filteredApplications addObject:app];
 		}
 	}
+	// In macOS 10.15 and later, the returned array is sorted with the first element containing the best available apps for opening the specified URL.
+	// So we should be able to get rid of the above loop when we drop support for <10.15
 	NSArray *sortedApplications = [filteredApplications sortedArrayUsingComparator:^NSComparisonResult(NSURL *obj1, NSURL *obj2) {
 		NSString *path1 = obj1.path;
 		NSString *path2 = obj2.path;
@@ -1036,11 +1083,11 @@ static NSRect ScaledCenteredRect(NSSize sourceSize, NSRect boundsRect) {
 		return result;
 	}];
 	NSMutableArray *sortedAppIdentifiers = [NSMutableArray arrayWithCapacity:appIdentifiers.count];
-	NSMenu *openWithMenu = [[[NSMenu alloc] init] autorelease];
+	NSMenu *openWithMenu = [[NSMenu alloc] init];
 	if (![selfIdentifier isEqualToString:defaultIdentifier]) {
 		[sortedAppIdentifiers addObject:defaultIdentifier];
 		NSString *path = defaultAppURL.path;
-		NSMenuItem *item = [[[NSMenuItem alloc] initWithTitle:[fm displayNameAtPath:path] action:@selector(openWith:) keyEquivalent:@""] autorelease];
+		NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:[fm displayNameAtPath:path] action:@selector(openWith:) keyEquivalent:@""];
 		item.image = [ws iconForFile:path];
 		item.image.size = NSMakeSize(16, 16);
 		[openWithMenu addItem:item];
@@ -1055,12 +1102,12 @@ static NSRect ScaledCenteredRect(NSSize sourceSize, NSRect boundsRect) {
 		if ([displayNames countForObject:displayName] > 1) {
 			displayName = [displayName stringByAppendingString:[NSString stringWithFormat:@" (%@)", appIdentifier]];
 		}
-		NSMenuItem *item = [[[NSMenuItem alloc] initWithTitle:displayName action:@selector(openWith:) keyEquivalent:@""] autorelease];
+		NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:displayName action:@selector(openWith:) keyEquivalent:@""];
 		item.image = [ws iconForFile:path];
 		item.image.size = NSMakeSize(16, 16);
 		[openWithMenu addItem:item];
 	}
-	self.openWithAppIdentifiers = [[sortedAppIdentifiers copy] autorelease];
+	self.openWithAppIdentifiers = [sortedAppIdentifiers copy];
     NSMenu *menu = [appDelegate thumbnailContextMenu];
 	[menu itemAtIndex:0].submenu = openWithMenu;
 	return menu;

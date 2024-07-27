@@ -1,4 +1,4 @@
-//Copyright 2005 Dominic Yu. Some rights reserved.
+//Copyright 2005-2023 Dominic Yu. Some rights reserved.
 //This work is licensed under the Creative Commons
 //Attribution-NonCommercial-ShareAlike License. To view a copy of this
 //license, visit http://creativecommons.org/licenses/by-nc-sa/2.0/ or send
@@ -18,7 +18,6 @@
 
 - (void)setTitle:(NSString *)s {
 	if (s == title) return;
-	[title release];
 	title = [s copy];
 }
 - (NSString *)title {
@@ -26,10 +25,10 @@
 }
 
 - (void)drawInteriorWithFrame:(NSRect)cellFrame inView:(NSView *)controlView {
-	id myStringValue = [self stringValue];
-	[self setStringValue:title];
+	NSString *myStringValue = self.stringValue;
+	self.stringValue = title ?: @"";
 	[super drawInteriorWithFrame:cellFrame inView:controlView];
-	[self setStringValue:myStringValue];
+	self.stringValue = myStringValue;
 }
 
 @end
@@ -38,21 +37,21 @@
 @end
 @implementation DYCreeveyBrowserMatrix
 - (BOOL)validateMenuItem:(NSMenuItem *)menuItem {
-	if ([menuItem action] == @selector(selectAll:)) return YES;
+	if (menuItem.action == @selector(selectAll:)) return YES;
 	return [super validateMenuItem:menuItem];
 }
 - (void)selectAll:(id)sender {
-	[(CreeveyMainWindowController *)[[self window] delegate] selectAll:sender]; // to pass it to image matrix
+	[(CreeveyMainWindowController *)self.window.delegate selectAll:sender]; // to pass it to image matrix
 }
 - (void)keyDown:(NSEvent *)e {
 	unichar c = 0;
-	if ([e characters].length == 1)
-		c = [[e characters] characterAtIndex:0];
+	if (e.characters.length == 1)
+		c = [e.characters characterAtIndex:0];
 	if (c == NSPageUpFunctionKey || c == NSPageDownFunctionKey)
-		if ([self frame].size.height > [[self superview] frame].size.height)
-			[[self superview] keyDown:e]; // scroll ourselves
+		if (self.frame.size.height > self.superview.frame.size.height)
+			[self.superview keyDown:e]; // scroll ourselves
 		else
-			[(CreeveyMainWindowController *)[[self window] delegate] fakeKeyDown:e]; // scroll img matrix
+			[(CreeveyMainWindowController *)self.window.delegate fakeKeyDown:e]; // scroll img matrix
 	else
 		[super keyDown:e];
 }
@@ -63,24 +62,33 @@
 @end
 @implementation DYTransparentGreyView
 - (void)drawRect:(NSRect)rect {
-	[[[NSColor lightGrayColor] colorWithAlphaComponent:0.5] set];
+	[[NSColor.lightGrayColor colorWithAlphaComponent:0.5] set];
 	[NSBezierPath fillRect:rect];
 }
 @end
 
 @implementation DYCreeveyBrowser
-//why doesn't IB let me set this as a custom class of an NSBrowser???
-//it calls a different init method
-- (id)initWithFrame:(NSRect)frameRect {
+{
+	NSMutableString *typedString;
+	NSTimeInterval lastKeyTime;
+	DYTransparentGreyView *greyview; // for drag-and-drop
+}
+@dynamic delegate; // use super.delegate
+
+- (instancetype)initWithFrame:(NSRect)frameRect {
 	if (self = [super initWithFrame:frameRect]) {
+// I don't think there's an easy way to catch events/messages to first responder without using a custom matrix class
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 		[self setMatrixClass:[DYCreeveyBrowserMatrix class]];
-		[self setTitled:NO];
-		[self setHasHorizontalScroller:YES];
+#pragma GCC diagnostic pop
+		self.titled = NO;
+		self.hasHorizontalScroller = YES;
 		[self setCellClass:[DYBrowserCell class]];
-		[[self cellPrototype] setFont:[NSFont systemFontOfSize:[NSFont smallSystemFontSize]-1]];
-		[self setAllowsEmptySelection:NO];
-		[self setColumnResizingType:NSBrowserUserColumnResizing];
-		[self setPrefersAllColumnUserResizing:NO];
+		[self.cellPrototype setFont:[NSFont systemFontOfSize:NSFont.smallSystemFontSize-1]];
+		self.allowsEmptySelection = NO;
+		self.columnResizingType = NSBrowserUserColumnResizing;
+		self.prefersAllColumnUserResizing = NO;
 		
 		typedString = [[NSMutableString alloc] init];
 		[self registerForDraggedTypes:@[NSFilenamesPboardType]];
@@ -89,26 +97,12 @@
 	return self;
 }
 
-- (void)dealloc {
-	[typedString release];
-	[greyview release];
-	[super dealloc];
-}
-
-- (id <NSBrowserDelegate,DYCreeveyBrowserDelegate>)delegate {
-	return (id <NSBrowserDelegate,DYCreeveyBrowserDelegate>)[super delegate];
-}
-
 #define KEYPRESS_INTERVAL 0.5
 
 - (void)keyDown:(NSEvent *)e {
-	if (![[self delegate] respondsToSelector:@selector(browser:typedString:inColumn:)]) {
-		[super keyDown:e];
-		return;
-	}
 	unichar c = 0;
-	if ([e characters].length == 1)
-		c = [[e characters] characterAtIndex:0];
+	if (e.characters.length == 1)
+		c = [e.characters characterAtIndex:0];
 	if ((c >= 0xF700 && c <= 0xF8FF) || [[NSCharacterSet controlCharacterSet] characterIsMember:c] || [[NSCharacterSet newlineCharacterSet] characterIsMember:c]) {
 		// NSPageUpFunctionKey, NSPageDownFunctionKey, arrow keys, etc.
 		[typedString setString:@""];
@@ -121,39 +115,43 @@
 
 - (void)insertText:(id)insertString {
 	NSString *s = insertString;
-	NSTimeInterval t = [NSDate timeIntervalSinceReferenceDate];
+	NSTimeInterval t = NSDate.timeIntervalSinceReferenceDate;
 	if (t - lastKeyTime < KEYPRESS_INTERVAL)
 		[typedString appendString:s];
 	else
 		[typedString setString:s];
 	lastKeyTime = t;
 	
-	[[self delegate] browser:self typedString:typedString inColumn:[self selectedColumn]];
+	[self.delegate browser:self typedString:typedString inColumn:self.selectedColumn];
 }
 
 - (BOOL)sendAction {
-	if ([[self delegate] respondsToSelector:@selector(browserWillSendAction:)])
-		[[self delegate] browserWillSendAction:self];
+	[self.delegate browserWillSendAction:self];
 	return [super sendAction];
 }
 
 #pragma mark dragging stuff
 - (NSDragOperation)draggingEntered:(id <NSDraggingInfo>)sender {
-    NSPasteboard *pboard;
-    NSDragOperation sourceDragMask;
-	
-    sourceDragMask = [sender draggingSourceOperationMask];
-	pboard = [sender draggingPasteboard];
-	//NSLog(@"%g", NSAppKitVersionNumber);
-    if ( [[pboard types] containsObject:NSFilenamesPboardType] ) {
-        if ((sourceDragMask & NSDragOperationGeneric)
-			&& floor(NSAppKitVersionNumber) <= 949) { // disable the grey box for 10.6, since dragging doesn't work in the nsbrowser anyway
-			[greyview setFrame:[self bounds]];
+    if ([sender.draggingPasteboard.types containsObject:NSFilenamesPboardType]) {
+        if (sender.draggingSourceOperationMask & NSDragOperationGeneric) {
+			greyview.frame = self.bounds;
 			[self addSubview:greyview];
             return NSDragOperationGeneric;
         }
     }
     return NSDragOperationNone;
+}
+
+- (BOOL)wantsPeriodicDraggingUpdates {
+	return NO;
+}
+
+- (NSDragOperation)draggingUpdated:(id<NSDraggingInfo>)sender
+{
+	if (sender.draggingSourceOperationMask & NSDragOperationGeneric) {
+		return NSDragOperationGeneric;
+	}
+	return NSDragOperationNone;
 }
 
 - (void)draggingExited:(id <NSDraggingInfo>)sender {
@@ -168,21 +166,14 @@
 - (BOOL)performDragOperation:(id <NSDraggingInfo>)sender {
     NSPasteboard *pboard;
     NSDragOperation sourceDragMask;
-    sourceDragMask = [sender draggingSourceOperationMask];
-    pboard = [sender draggingPasteboard];
-    if ( [[pboard types] containsObject:NSFilenamesPboardType] ) {
+    sourceDragMask = sender.draggingSourceOperationMask;
+    pboard = sender.draggingPasteboard;
+    if ( [pboard.types containsObject:NSFilenamesPboardType] ) {
         NSArray *files = [pboard propertyListForType:NSFilenamesPboardType];
-		
-		
-        if (sourceDragMask & NSDragOperationGeneric) {
-			
-            [(CreeveyMainWindowController *)[[self window] delegate] openFiles:files withSlideshow:NO]; // **
-			
-        }
-		
+        if (sourceDragMask & NSDragOperationGeneric)
+            [(CreeveyMainWindowController *)self.window.delegate openFiles:files withSlideshow:NO];
     }
     return YES;
 }
-
 
 @end

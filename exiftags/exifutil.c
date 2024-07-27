@@ -68,15 +68,13 @@ exifdie(const char *msg)
 void
 exifwarn(const char *msg)
 {
-
-	fprintf(stderr, "%s: %s\n", progname, msg);
+//	fprintf(stderr, "%s: %s\n", progname, msg);
 }
 
 void
 exifwarn2(const char *msg1, const char *msg2)
 {
-
-	fprintf(stderr, "%s: %s (%s)\n", progname, msg1, msg2);
+//	fprintf(stderr, "%s: %s (%s)\n", progname, msg1, msg2);
 }
 
 
@@ -91,7 +89,8 @@ offsanity(struct exifprop *prop, u_int16_t size, struct ifd *dir)
 	const char *name;
 
 	/* XXX Hrm.  Should be OK with 64-bit addresses. */
-	tifflen = dir->md.etiff - dir->md.btiff;
+	// assuming no TIFF file is so big that the difference in offsets will be greater than UINT32_MAX
+	tifflen = (u_int32_t)(dir->md.etiff - dir->md.btiff);
 	if (prop->name)
 		name = prop->name;
 	else
@@ -317,7 +316,7 @@ childprop(struct exifprop *parent)
  * Allocate a buffer for a property's display string.
  */
 void
-exifstralloc(char **str, int len)
+exifstralloc(char **str, size_t len)
 {
 
 	if (*str) {
@@ -386,7 +385,7 @@ readifd(u_int32_t offset, struct ifd **dir, struct exiftag *tagset,
 	unsigned char *b;
 	struct ifdoff *ifdoffs, *lastoff;
 
-	tifflen = md->etiff - md->btiff;
+	tifflen = (u_int32_t)(md->etiff - md->btiff);
 	b = md->btiff;
 	ifdoffs = (struct ifdoff *)(md->ifdoffs);
 	lastoff = NULL;

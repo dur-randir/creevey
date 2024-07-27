@@ -1,12 +1,10 @@
-//Copyright 2005 Dominic Yu. Some rights reserved.
+//Copyright 2005-2014 Dominic Yu. Some rights reserved.
 //This work is licensed under the Creative Commons
 //Attribution-NonCommercial-ShareAlike License. To view a copy of this
 //license, visit http://creativecommons.org/licenses/by-nc-sa/2.0/ or send
 //a letter to Creative Commons, 559 Nathan Abbott Way, Stanford,
 //California 94305, USA.
 
-//  DYJpegtran.m
-//
 //  Created by Dominic Yu 2005 July 11
 
 #import "DYJpegtran.h"
@@ -53,18 +51,14 @@ static unsigned char *transformThumbnail(unsigned char *b, unsigned len,
 	jvirt_barray_ptr * dst_coef_arrays;
 	FILE * input_file;
 	FILE * output_file;
-	
-	//	if ((output_file = fopen("/tmp/blah.jpg","w+b")) == NULL) {
-	if ((output_file = tmpfile()) == NULL) {
-		return NULL;
-	}
-	//	if ((input_file = fopen("/tmp/blahin.jpg","w+b")) == NULL) {
-	if ((input_file = tmpfile()) == NULL) {
+	char *outBuf = NULL;
+	size_t bufLen;
+
+	if ((output_file = open_memstream(&outBuf, &bufLen)) == NULL) return NULL;
+	if ((input_file = fmemopen(b, len, "rb")) == NULL) {
 		fclose(output_file);
+		free(outBuf);
 		return NULL;
-	} else {
-		fwrite(b,len,1,input_file);
-		rewind(input_file);
 	}
 	srcinfo.err = jpeg_std_error(&jsrcerr.pub);
 	jsrcerr.pub.error_exit = _my_error_handler;
@@ -76,6 +70,7 @@ static unsigned char *transformThumbnail(unsigned char *b, unsigned len,
 		jpeg_destroy_decompress(&srcinfo);
 		fclose(input_file);
 		fclose(output_file);
+		free(outBuf);
 		return NULL;
 	}
 	jpeg_create_decompress(&srcinfo);
@@ -111,21 +106,11 @@ static unsigned char *transformThumbnail(unsigned char *b, unsigned len,
 	jpeg_destroy_decompress(&srcinfo);
 	
 	/* Close files, if we opened them */
-	//_epeg_memfile_read_close(input_file);
 	fclose(input_file);
-	long numbytes = ftell(output_file);
-	void *thebytes = malloc(numbytes);
-	fseek(output_file,0,SEEK_SET);
-	if (!thebytes ||
-		numbytes != fread(thebytes,sizeof(char),numbytes,output_file)) {
-		fclose(output_file);
-		return NULL;
-	}
-	fclose(output_file);
-	*outLen = numbytes;
-	return thebytes;
-	}
-
+	if (0 != fclose(output_file)) return NULL;
+	*outLen = (unsigned)bufLen;
+	return (unsigned char *)outBuf;
+}
 
 
 @implementation DYJpegtran
@@ -140,6 +125,8 @@ static unsigned char *transformThumbnail(unsigned char *b, unsigned len,
 	jvirt_barray_ptr * dst_coef_arrays;
 	FILE * input_file;
 	FILE * output_file;
+	char *outBuf = NULL;
+	size_t bufLen;
 	JCOPY_OPTION copyoption = i.cp;
 	jpeg_transform_info info_copy;
 	
@@ -204,12 +191,11 @@ static unsigned char *transformThumbnail(unsigned char *b, unsigned len,
 	}
 	
 	/* Open files first, so setjmp can assume they're open. */
-	if ((input_file = fopen([thePath fileSystemRepresentation], "rb")) == NULL) {
-		NSLog(@"DYJpegtran can't open %s\n", [thePath fileSystemRepresentation]);
+	if ((input_file = fopen(thePath.fileSystemRepresentation, "rb")) == NULL) {
+		NSLog(@"DYJpegtran can't open %s\n", thePath.fileSystemRepresentation);
 		return NO;
 	}
-	if ((output_file = tmpfile()) == NULL) {
-		NSLog(@"DYJpegtran can't open temp file\n");
+	if ((output_file = open_memstream(&outBuf, &bufLen)) == NULL) {
 		fclose(input_file);
 		return NO;
 	}
@@ -224,6 +210,7 @@ static unsigned char *transformThumbnail(unsigned char *b, unsigned len,
 		jpeg_destroy_decompress(&srcinfo);
 		fclose(input_file);
 		fclose(output_file);
+		free(outBuf);
 		NSLog(@"fatal error for %@", thePath);
 		return NO;
 	}
@@ -288,6 +275,7 @@ static unsigned char *transformThumbnail(unsigned char *b, unsigned len,
 		jpeg_destroy_decompress(&srcinfo);
 		fclose(input_file);
 		fclose(output_file);
+		free(outBuf);
 		//NSLog(@"No change! exiting transformImage");
 		return NO;
 	}
@@ -367,7 +355,7 @@ static unsigned char *transformThumbnail(unsigned char *b, unsigned len,
 		} else if (i.delThumb) {
 			newapp1 = delete_exif_thumb(app1markerptr->data,app1markerptr->data_length,&outSize);
 		} else if (i.replaceThumb) {
-			newapp1 = replace_exif_thumb((unsigned char *)[i.newThumb bytes],[i.newThumb length],
+			newapp1 = replace_exif_thumb((unsigned char *)i.newThumb.bytes,(unsigned)i.newThumb.length,
 										 i.newThumbSize.width,i.newThumbSize.height,
 										 app1markerptr->data,
 										 app1markerptr->data_length,
@@ -411,29 +399,17 @@ static unsigned char *transformThumbnail(unsigned char *b, unsigned len,
 	/* Close files, if we opened them */
 	fclose(input_file);
 	// save over orig file first
-	long numbytes = ftell(output_file);
-	//NSLog(@"%ld", numbytes);
-	void *thebytes = malloc(numbytes);
-	fseek(output_file,0,SEEK_SET);
-	if (!thebytes ||
-		numbytes != fread(thebytes,sizeof(char),numbytes,output_file)) {
-		fclose(output_file);
-		NSLog(@"couldn't copy the bytes!");
-		return NO;
-	}
-	fclose(output_file);
-	
+	if (0 != fclose(output_file)) return NO;
 	NSMutableArray *fkeys = [NSMutableArray arrayWithObjects:NSFileCreationDate, NSFileHFSCreatorCode, NSFileHFSTypeCode, nil];
 	if (i.preserveModificationDate)
 		[fkeys addObject:NSFileModificationDate];
-	NSArray *fatts = [[[NSFileManager defaultManager] attributesOfItemAtPath:[thePath stringByResolvingSymlinksInPath] error:NULL] objectsForKeys:fkeys notFoundMarker:[NSNull null]];
+	NSArray *fatts = [[NSFileManager.defaultManager attributesOfItemAtPath:thePath.stringByResolvingSymlinksInPath error:NULL] objectsForKeys:fkeys notFoundMarker:[NSNull null]];
 	//NSLog(@"%@", [fatts objectAtIndex:0]);
-	NSData *theData = [[NSData alloc] initWithBytesNoCopy:thebytes length:numbytes freeWhenDone:YES];
+	NSData *theData = [[NSData alloc] initWithBytesNoCopy:outBuf length:bufLen freeWhenDone:YES];
 	[theData writeToFile:thePath atomically:YES];
-	[theData release];
 	
 	//restore date created, hfs codes
-	[[NSFileManager defaultManager] setAttributes:[NSDictionary dictionaryWithObjects:fatts forKeys:fkeys]
+	[NSFileManager.defaultManager setAttributes:[NSDictionary dictionaryWithObjects:fatts forKeys:fkeys]
 									 ofItemAtPath:thePath error:NULL];
 	
 	/* All done. */

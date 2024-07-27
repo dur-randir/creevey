@@ -1,12 +1,10 @@
-//Copyright 2005 Dominic Yu. Some rights reserved.
+//Copyright 2005-2023 Dominic Yu. Some rights reserved.
 //This work is licensed under the Creative Commons
 //Attribution-NonCommercial-ShareAlike License. To view a copy of this
 //license, visit http://creativecommons.org/licenses/by-nc-sa/2.0/ or send
 //a letter to Creative Commons, 559 Nathan Abbott Way, Stanford,
 //California 94305, USA.
 
-//  DYImageView.m
-//  creevey
 //  Created by d on 2005.04.01.
 
 #import "DYImageView.h"
@@ -16,14 +14,22 @@
 
 
 @implementation DYImageView
+{
+	NSImage *image;
+	NSTimer *gifTimer;
+	NSArray *_webpFrameInfo; int _webpCurrentFrame; NSUInteger _webpFrameCount;
+	int rotation;
+	BOOL scalesUp, showActualSize, isImageFlipped;
+	NSRect sourceRect;
+	NSSize destSize;
+	float zoomF;
+}
 
 // helper method to calculate appropriate zoom factor
 - (float)zoomForFit {
 	float tmp;
-	NSSize imgSize = [image size]; // in pixels
-	NSSize bSize = [self convertRect:[self bounds] toView:nil].size; // in pixels (window units)
-	bSize.height -= [[NSScreen mainScreen] safeAreaInsets].top;
-
+	NSSize imgSize = image.size; // in pixels
+	NSSize bSize = [self convertRect:self.bounds toView:nil].size; // in pixels (window units)
 	if (rotation == 90 || rotation == -90) {
 		tmp = bSize.width;
 		bSize.width = bSize.height;
@@ -52,12 +58,10 @@
 	
 	NSRect srcRect, destinationRect;
 	float zoom = zoomF;
-	NSRect boundsRect = [self convertRect:[self bounds] toView:nil];
-	boundsRect.size.height -= [[NSScreen mainScreen] safeAreaInsets].top;
-
+	NSRect boundsRect = [self convertRect:self.bounds toView:nil];
 	float centerX, centerY; float tmp;
-	centerX = boundsRect.size.width/2;
-	centerY = boundsRect.size.height/2;
+	centerX = (int)(boundsRect.size.width/2);
+	centerY = (int)(boundsRect.size.height/2);
 	if (zoomF) {
 		srcRect = sourceRect;
 		destinationRect.size = destSize;
@@ -69,7 +73,7 @@
 		}
 		
 		srcRect.origin = NSZeroPoint;
-		srcRect.size = [image size];
+		srcRect.size = image.size;
 		
 		if (!scalesUp
 			&& srcRect.size.width <= boundsRect.size.width
@@ -97,7 +101,7 @@
 	destinationRect.origin.x = (int)(centerX - destinationRect.size.width/2);
 	destinationRect.origin.y = (int)(centerY - destinationRect.size.height/2);
 	
-	[[NSColor whiteColor] set]; // make a nice background for transparent gifs, etc.
+	[NSColor.whiteColor set]; // make a nice background for transparent gifs, etc.
 	if (rotation == 0 || rotation == 180) {
 		// convert destinationRect to view coords
 		destinationRect = [self convertRect:destinationRect fromView:nil];
@@ -117,60 +121,96 @@
 		destinationRect = [self convertRect:destinationRect fromView:nil];
 		[NSBezierPath fillRect:destinationRect];
 	}
-	NSGraphicsContext *cg = [NSGraphicsContext currentContext];
-	NSImageInterpolation oldInterp = [cg imageInterpolation];
-	[cg setImageInterpolation:zoom > 1 ? NSImageInterpolationNone : NSImageInterpolationHigh];
-	[image drawInRect:destinationRect fromRect:srcRect operation:NSCompositeSourceOver fraction:1.0];
-	[cg setImageInterpolation:oldInterp];
+	NSGraphicsContext *cg = NSGraphicsContext.currentContext;
+	NSImageInterpolation oldInterp = cg.imageInterpolation;
+	cg.imageInterpolation = zoom >= 4 ? NSImageInterpolationNone : NSImageInterpolationHigh;
+	NSImage *toDraw = image;
+	if (_webpImageSource) {
+		CGImageRef webpFrame = CGImageSourceCreateImageAtIndex((CGImageSourceRef)_webpImageSource, _webpCurrentFrame, NULL);
+		if (webpFrame) {
+			toDraw = [[NSImage alloc] initWithCGImage:webpFrame size:NSZeroSize];
+			if (!gifTimer || gifTimer.userInfo != _webpImageSource) {
+				float frameDuration = [_webpFrameInfo[_webpCurrentFrame][@"DelayTime"] floatValue];
+				if (frameDuration < .01) frameDuration = .01; // minimum of 10ms is apparently standard
+				gifTimer = [NSTimer scheduledTimerWithTimeInterval:frameDuration target:self selector:@selector(animateWebp:) userInfo:_webpImageSource repeats:NO];
+				gifTimer.tolerance = frameDuration*0.1;
+			}
+		}
+		CFRelease(webpFrame);
+	}
+	[toDraw drawInRect:destinationRect fromRect:srcRect operation:NSCompositingOperationSourceOver fraction:1.0];
+	cg.imageInterpolation = oldInterp;
 	
 	[transform invert];
 	[transform concat];
-	id rep = [image representations][0];
+
+	if (image != toDraw) return; // animating webp, so no need to check if animating gif
+	id rep = image.representations[0];
 	if ([rep isKindOfClass:[NSBitmapImageRep class]]
 		&& [rep valueForProperty:NSImageFrameCount]) {
-		if (!gifTimer || [gifTimer userInfo] != image) {
+		if (!gifTimer || gifTimer.userInfo != image) {
 			float frameDuration = [[rep valueForProperty:NSImageCurrentFrameDuration] floatValue];
 			gifTimer = [NSTimer scheduledTimerWithTimeInterval:frameDuration
 														target:self selector:@selector(animateGIF:)
 													  userInfo:image repeats:NO];
-			[gifTimer setTolerance:frameDuration*0.15];
+			gifTimer.tolerance = frameDuration*0.15;
 		}
 	}
 }
 
 - (void)animateGIF:(NSTimer *)t {
 	gifTimer = nil;
-	if (image != [t userInfo]) return; // stop if image is changed
+	if (image != t.userInfo) return; // stop if image is changed
 	
-	NSBitmapImageRep *rep = (NSBitmapImageRep *)[[t userInfo] representations][0];
+	NSBitmapImageRep *rep = (NSBitmapImageRep *)[t.userInfo representations][0];
 	NSNumber *frameCount = [rep valueForProperty:NSImageFrameCount];
 	int n = [[rep valueForProperty:NSImageCurrentFrame] intValue];
-	if (++n == [frameCount intValue]) n = 0;
+	if (++n == frameCount.intValue) n = 0;
 	[rep setProperty:NSImageCurrentFrame withValue:@(n)];
+	[self setNeedsDisplay:YES];
+}
+
+- (void)setWebpImageSource:(id)src {
+	_webpImageSource = nil;
+	CFDictionaryRef props = CGImageSourceCopyProperties((CGImageSourceRef)src, NULL);
+	if (props) {
+		NSArray *frameInfo = ((__bridge NSDictionary *)props)[@"{WebP}"][@"FrameInfo"];
+		if (frameInfo && (_webpFrameCount = frameInfo.count) > 1) {
+			_webpImageSource = src;
+			_webpFrameInfo = frameInfo;
+		}
+		CFRelease(props);
+	}
+}
+
+- (void)animateWebp:(NSTimer *)t {
+	gifTimer = nil;
+	if (_webpImageSource != t.userInfo) return;
+	if (++_webpCurrentFrame == _webpFrameCount) _webpCurrentFrame = 0;
 	[self setNeedsDisplay:YES];
 }
 
 - (void)setImage:(NSImage *)anImage {
 	if (anImage != image) {
-		[image release];
-		image = [anImage retain];
+		image = anImage;
+		_webpImageSource = nil;
+		_webpCurrentFrame = 0;
 	}
 	zoomF = 0;
 	rotation = 0;
 	isImageFlipped = NO;
 
-	[[NSCursor arrowCursor] set];
+	[NSCursor.arrowCursor set];
 	[self setNeedsDisplay:YES];
 }
 
 - (void)setImage:(NSImage *)anImage zooming:(DYImageViewZoomMode)zoomMode {
 	if (anImage != image) {
 		if (!anImage) return; 
-		[image release];
-		image = [anImage retain];
-		NSImageRep *rep = [image representations][0]; // ** assume not corrupt
+		image = anImage;
+		NSImageRep *rep = image.representations[0]; // ** assume not corrupt
 		if ([rep isKindOfClass:[NSBitmapImageRep class]]) {
-			[image setSize:NSMakeSize([rep pixelsWide], [rep pixelsHigh])];
+			image.size = NSMakeSize(rep.pixelsWide, rep.pixelsHigh);
 		} // ** cat on nsimage?
 	}
 	if (zoomMode == DYImageViewZoomModeManual) {
@@ -200,11 +240,9 @@
 
 - (void)setZoomAndCenter:(BOOL)center {
 	if (!image) return; 
-	NSSize imgSize = [image size];
+	NSSize imgSize = image.size;
 	float tmp;
-	NSSize bSize = [self convertRect:[self bounds] toView:nil].size;
-	bSize.height -= [[NSScreen mainScreen] safeAreaInsets].top;
-
+	NSSize bSize = [self convertRect:self.bounds toView:nil].size;
 	if (rotation == 90 || rotation == -90) {
 		tmp = bSize.height;
 		bSize.height = bSize.width;
@@ -301,7 +339,7 @@
 	[self setNeedsDisplay:YES];
 }
 
-- (void)setFlip:(BOOL)b {
+- (void)setImageFlipped:(BOOL)b {
 	isImageFlipped = b;
 	[self setNeedsDisplay:YES];
 }
@@ -364,12 +402,10 @@
 
 - (void)setZoomF:(float)f {
 	if (!image) return; 
-	NSSize imgSize = [image size];
+	NSSize imgSize = image.size;
 
 	float tmp;
-	NSSize bSize = [self convertRect:[self bounds] toView:nil].size;
-	bSize.height -= [[NSScreen mainScreen] safeAreaInsets].top;
-
+	NSSize bSize = [self convertRect:self.bounds toView:nil].size;
 	if (rotation == 90 || rotation == -90) {
 		tmp = bSize.height;
 		bSize.height = bSize.width;
@@ -445,8 +481,8 @@
 	x /= zoomF;
 	y /= zoomF;
 	float xmax,ymax;
-	xmax = [image size].width - sourceRect.size.width;
-	ymax = [image size].height - sourceRect.size.height;
+	xmax = image.size.width - sourceRect.size.width;
+	ymax = image.size.height - sourceRect.size.height;
 	if (xmax > 0 || ymax > 0) {
 		switch (rotation) {
 			case -90:
@@ -479,24 +515,24 @@
 }
 
 - (void)scrollWheel:(NSEvent *)e {
-	if ([self dragMode])
-		[self fakeDragX:[e deltaX]*128 y:-[e deltaY]*128];
+	if (self.dragMode)
+		[self fakeDragX:e.deltaX*128 y:-e.deltaY*128];
 	else
 		[super scrollWheel:e];
 }
 - (void)mouseDown:(NSEvent *)e {
-	if ([self dragMode]) {
-		[[NSCursor closedHandCursor] push];
+	if (self.dragMode) {
+		[NSCursor.closedHandCursor push];
 	}
 	[super mouseDown:e];
 }
 - (void)mouseDragged:(NSEvent *)e {
 	if (zoomF)
-		[self fakeDragX:[e deltaX] y:-[e deltaY]]; // y is flipped?
-	[[NSCursor closedHandCursor] set];
+		[self fakeDragX:e.deltaX y:-e.deltaY]; // y is flipped?
+	[NSCursor.closedHandCursor set];
 }
 - (void)mouseUp:(NSEvent *)e {
-	if ([self dragMode]) {
+	if (self.dragMode) {
 		[NSCursor pop];
 		[self setCursor];
 	}
@@ -506,7 +542,7 @@
 - (void)zoomOff {
 	if (zoomF) {
 		zoomF = 0;
-		[[NSCursor arrowCursor] set];
+		[NSCursor.arrowCursor set];
 		[self setNeedsDisplay:YES];
 	}
 }
@@ -517,7 +553,7 @@
 	i->zoomF = zoomF;
 	i->sourceRect = sourceRect;
 	i->destSize = destSize;
-	return [i autorelease];
+	return i;
 }
 - (void)setZoomInfo:(DYImageViewZoomInfo *)i {
 	zoomF = i->zoomF;
@@ -531,7 +567,7 @@
 	if (showActualSize) {
 		if (zoomF != 1) return YES;
 		
-		NSSize imgSize = [image size];
+		NSSize imgSize = image.size;
 		return (sourceRect.origin.x != sourceRect.size.width > imgSize.width ? 0 : (imgSize.width - sourceRect.size.width)/2)
 			|| (sourceRect.origin.y != sourceRect.size.height > imgSize.height ? 0 : (imgSize.height - sourceRect.size.height)/2);
 	} else {
@@ -545,16 +581,16 @@
 
 - (BOOL)dragMode {
 	if (zoomF == 0) return NO;
-	NSSize imgSize = [image size];
+	NSSize imgSize = image.size;
 	return sourceRect.size.width < imgSize.width || sourceRect.size.height < imgSize.height;
 }
 - (void)setCursor {
 	// sets hand or arrow, depending
-	if ([self dragMode]) {
-		[[NSCursor openHandCursor] set];
+	if (self.dragMode) {
+		[NSCursor.openHandCursor set];
 		[NSCursor setHiddenUntilMouseMoves:NO]; // NOT unhide
 	} else {
-		[[NSCursor arrowCursor] set];
+		[NSCursor.arrowCursor set];
 	}
 }
 

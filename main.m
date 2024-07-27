@@ -1,21 +1,14 @@
-//
-//  main.m
-//  creevey
-//
-//  Created by d on Fri Mar 18 2005.
-//  Copyright (c) 2005 __MyCompanyName__. All rights reserved.
-//
-
-#import <Cocoa/Cocoa.h>
+@import Cocoa;
 
 int main(int argc, const char *argv[])
 {
-	if (floor(NSAppKitVersionNumber) <= NSAppKitVersionNumber10_8) {
+	if (floor(NSAppKitVersionNumber) <= NSAppKitVersionNumber10_12) {
 		@autoreleasepool {
 			NSApplicationLoad();
-			NSRunAlertPanel(@"Incompatible System Version",
-							@"This program requires OS X 10.9 (Mavericks) or later.",
-							nil, nil, nil);
+			NSAlert *alert = [[NSAlert alloc] init];
+			alert.messageText = @"Incompatible System Version";
+			alert.informativeText = @"This program requires macOS 10.13 (High Sierra) or later.";
+			[alert runModal];
 		}
 		return 0;
 	}
